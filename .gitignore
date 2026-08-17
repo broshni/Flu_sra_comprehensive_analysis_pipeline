@@ -1,0 +1,17 @@
+# Real config (has your email + BV-BRC workspace path) -- copy
+# config.yaml.example to config.yaml and fill in your own values.
+config.yaml
+
+# Pipeline outputs and logs -- regenerated on every run, not source.
+results/
+logs/
+
+# Snakemake's own bookkeeping.
+.snakemake/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS cruft
+.DS_Store

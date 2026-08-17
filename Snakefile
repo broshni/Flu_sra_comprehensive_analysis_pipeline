@@ -1,0 +1,500 @@
+"""
+Extended pipeline: SRA selection -> BV-BRC assembly -> BV-BRC annotation.
+
+A second, fully independent pipeline from ../Snakefile (the base pipeline).
+It never reads or writes ../Snakefile, ../config.yaml, or ../scripts/ -- all
+scripts it needs (including the three BV-BRC helper scripts also used by the
+base pipeline) live in this folder's own scripts/, and its own config.yaml
+has its own bvbrc: section. Nothing here ever shells out to the base
+pipeline.
+
+One command does everything:
+  1. SRA selection -- given a list of BioProject accessions, pull every SRA
+     run + RunInfo metadata (scripts/fetch_sra_runs_by_bioproject.py), look
+     up any GenBank records already linked to each run's BioSample
+     (scripts/biosample_to_genbank.py), join the two tables
+     (scripts/join_tables_by_biosample.py), and split into runs with vs.
+     without a linked GenBank accession (scripts/select_no_genbank.py).
+  2. Assembly + annotation -- for every run with NO linked GenBank
+     accession, submit it to BV-BRC's IRMA-based Viral Assembly service,
+     then its assembled contigs to BV-BRC's Genome Annotation service
+     (VIGOR4), exactly like the base pipeline does, using the same
+     scripts/pick_contigs.py and scripts/make_summary.py helpers (copied
+     here, not shared at runtime). If step 1 finds zero runs with a missing
+     GenBank accession, step 2 simply has nothing to do -- see
+     `aggregate_summary_reports` below.
+
+`select_no_genbank` is declared as a Snakemake *checkpoint*, not a plain
+rule, because step 2's sample list isn't known until step 1 has actually
+run. Snakemake re-evaluates the DAG once the checkpoint completes, so a
+single `snakemake` invocation does both steps in the right order
+automatically -- see README.md for what this means for dry-run output.
+
+Requires: biopython, pandas
+    pip install biopython pandas --break-system-packages   # in the sandbox
+    pip install biopython pandas                            # on a normal machine/venv
+"""
+
+import csv
+import os
+import re
+import sys
+
+configfile: "config.yaml"
+
+SRA_CFG = config.get("sra_selection", {})
+BVBRC = config.get("bvbrc", {})
+
+
+def parse_list(value):
+    """Split a comma/space/semicolon separated string, or pass a list through."""
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return [s for s in re.split(r"[,\s;]+", str(value).strip()) if s]
+
+
+RUN_NAME = str(config.get("sra_run_name", SRA_CFG.get("run_name", "default"))).strip() or "default"
+BIOPROJECTS = parse_list(config.get("sra_bioprojects", SRA_CFG.get("bioprojects", [])))
+BIOPROJECT_FILE = str(config.get("sra_bioproject_file", SRA_CFG.get("bioproject_file", ""))).strip()
+MINDATE = str(config.get("sra_mindate", SRA_CFG.get("mindate", ""))).strip()
+MAXDATE = str(config.get("sra_maxdate", SRA_CFG.get("maxdate", ""))).strip()
+EMAIL = str(config.get("sra_email", SRA_CFG.get("email", ""))).strip()
+API_KEY = str(config.get("sra_api_key", SRA_CFG.get("api_key", ""))).strip()
+
+if not BIOPROJECTS and not BIOPROJECT_FILE:
+    raise ValueError(
+        "No BioProjects given. Set sra_selection.bioprojects (or "
+        "sra_selection.bioproject_file) in config.yaml, or pass "
+        "--config sra_bioprojects=PRJNA1,PRJNA2."
+    )
+if not EMAIL:
+    raise ValueError(
+        "sra_selection.email is required (NCBI Entrez requires a contact "
+        "email) -- set it in config.yaml, or pass --config sra_email=..."
+    )
+
+OUT_DIR = f"results/{RUN_NAME}"
+LOG_DIR = f"logs/{RUN_NAME}"
+NO_GENBANK_TSV = f"{OUT_DIR}/no_genbank_samples.tsv"
+
+# Extra CLI args built once at parse time (these scripts' flags are only
+# needed when the corresponding value is actually set).
+FETCH_EXTRA_ARGS = []
+if BIOPROJECT_FILE:
+    FETCH_EXTRA_ARGS += ["--bioproject-file", BIOPROJECT_FILE]
+if API_KEY:
+    FETCH_EXTRA_ARGS += ["--api-key", API_KEY]
+if MINDATE:
+    FETCH_EXTRA_ARGS += ["--sra-mindate", MINDATE]
+if MAXDATE:
+    FETCH_EXTRA_ARGS += ["--sra-maxdate", MAXDATE]
+FETCH_EXTRA_ARGS_STR = " ".join(FETCH_EXTRA_ARGS)
+
+BIOSAMPLE_EXTRA_ARGS_STR = f"--api_key {API_KEY}" if API_KEY else ""
+
+# ---------------------------------------------------------------------------
+# Stage 2 config -- this pipeline's own bvbrc: section (independent of
+# ../config.yaml; edit this folder's config.yaml to change any of it).
+# ---------------------------------------------------------------------------
+WS_BASE = str(BVBRC.get("workspace_base", "")).rstrip("/")
+if not WS_BASE:
+    raise ValueError(
+        "bvbrc.workspace_base is not set in config.yaml -- required so "
+        "step 2 (assembly/annotation) knows where to submit jobs on BV-BRC."
+    )
+POLL = BVBRC.get("poll_interval_sec", 30)
+TIMEOUT = BVBRC.get("timeout_sec", 21600)
+STRATEGY = BVBRC.get("viral_assembly_strategy", "IRMA")
+ANNOTATION_RECIPE = BVBRC.get("annotation_recipe", "viral-lowvan")
+GENETIC_CODE = BVBRC.get("genetic_code", 11)
+DOMAIN = BVBRC.get("domain", "Bacteria")
+ANNOTATION_PUBLIC = BVBRC.get("public", True)
+PUBLIC_FLAG = "--public" if ANNOTATION_PUBLIC else ""
+
+# Per-sample local/remote paths for stage 2, all namespaced under this run's
+# folder so they never collide with the *.tsv files stage 1 writes directly
+# into OUT_DIR, or with another run_name's samples.
+SAMPLES_LOCAL_PREFIX = f"{OUT_DIR}/samples/"
+SAMPLES_LOG_PREFIX = f"{LOG_DIR}/samples/"
+WS_SAMPLE_BASE = f"{WS_BASE}/{RUN_NAME}"
+
+
+def load_samples_from_tsv(path):
+    """Same TSV shape/columns as the base pipeline's samples_tsv loader --
+    reads the "Run" column select_no_genbank.py writes."""
+    samples = {}
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        fieldnames = reader.fieldnames or []
+        lower_to_actual = {name.lower(): name for name in fieldnames}
+        run_col = lower_to_actual.get("run")
+        if run_col is None:
+            return {}
+        for row in reader:
+            srr = (row.get(run_col) or "").strip()
+            if not srr:
+                continue
+            samples[srr] = {
+                "srr": srr,
+                "scientific_name": (row.get("scientific_name") or "").strip(),
+                "reference_virus": (row.get("reference_virus") or "").strip(),
+                "taxonomy_id": (row.get("taxonomy_id") or "").strip(),
+            }
+    return samples
+
+
+def get_sample_field(sample, field):
+    """Look up one field for one sample from NO_GENBANK_TSV, re-reading the
+    file fresh each call. Used by stage-2 rules' params -- by the time any
+    of them actually run, the select_no_genbank checkpoint has already
+    completed (Snakemake guarantees this), so the file is there and final.
+    A plain module-level dict computed at parse time would be stale here,
+    since parsing happens before the checkpoint has produced anything."""
+    return load_samples_from_tsv(NO_GENBANK_TSV).get(sample, {}).get(field, "")
+
+
+def aggregate_summary_reports(wildcards):
+    """Input function for rule all: forces the select_no_genbank checkpoint
+    to run first, then reads its output to build the concrete list of
+    per-sample summary_report.md targets. If no runs are missing a GenBank
+    accession, this returns an empty list -- stage 2 then has nothing to do
+    and the pipeline stops there, exactly as intended."""
+    checkpoint_output = checkpoints.select_no_genbank.get(**wildcards).output.no_genbank
+    samples = load_samples_from_tsv(checkpoint_output)
+    if not samples:
+        print(
+            f"[extended pipeline] No SRA runs with a missing GenBank accession "
+            f"for run '{RUN_NAME}' -- nothing to assemble/annotate.",
+            file=sys.stderr,
+        )
+        return []
+    return expand(SAMPLES_LOCAL_PREFIX + "{sample}/summary_report.md", sample=list(samples.keys()))
+
+
+rule all:
+    input:
+        NO_GENBANK_TSV,
+        f"{OUT_DIR}/with_genbank_samples.tsv",
+        f"{OUT_DIR}/.sra_lists_published",
+        aggregate_summary_reports,
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: SRA selection
+# ---------------------------------------------------------------------------
+
+rule fetch_sra_runinfo:
+    output:
+        f"{OUT_DIR}/01_sra_runinfo.tsv",
+    params:
+        bioprojects=" ".join(BIOPROJECTS),
+        bioprojects_display=", ".join(BIOPROJECTS) + (f" (+ {BIOPROJECT_FILE})" if BIOPROJECT_FILE else ""),
+        extra_args=FETCH_EXTRA_ARGS_STR,
+        email=EMAIL,
+        cache_dir=f"{OUT_DIR}/ncbi_cache",
+    log:
+        f"{LOG_DIR}/fetch_sra_runinfo.log",
+    shell:
+        """
+        mkdir -p {OUT_DIR} {LOG_DIR}
+        python3 scripts/fetch_sra_runs_by_bioproject.py \
+            --bioprojects {params.bioprojects} \
+            --email {params.email} \
+            --output {output} --format tsv \
+            --cache-dir {params.cache_dir} \
+            {params.extra_args} &> {log}
+
+        # fetch_sra_runs_by_bioproject.py already skips individual
+        # BioProjects that return zero SRA runs and continues with the
+        # rest (see its per-BioProject "Found N SRA ids" log lines) -- it
+        # only writes a genuinely empty file here if NONE of the given
+        # BioProjects returned anything. Stop clearly in that case instead
+        # of letting the next step fail with a confusing pandas error.
+        if [ ! -s {output} ]; then
+            echo "ERROR: No SRA runs found for any of these BioProjects: {params.bioprojects_display}. See {log} for per-BioProject search details." | tee -a {log} >&2
+            exit 1
+        fi
+        """
+
+
+rule biosample_to_genbank:
+    input:
+        f"{OUT_DIR}/01_sra_runinfo.tsv",
+    output:
+        f"{OUT_DIR}/02_genbank_by_biosample.tsv",
+    params:
+        email=EMAIL,
+        extra_args=BIOSAMPLE_EXTRA_ARGS_STR,
+    log:
+        f"{LOG_DIR}/biosample_to_genbank.log",
+    shell:
+        """
+        python3 scripts/biosample_to_genbank.py \
+            --input_csv {input} --column BioSample \
+            --email {params.email} {params.extra_args} \
+            --out {output} --format tsv &> {log}
+        """
+
+
+rule join_by_biosample:
+    input:
+        sra=f"{OUT_DIR}/01_sra_runinfo.tsv",
+        genbank=f"{OUT_DIR}/02_genbank_by_biosample.tsv",
+    output:
+        f"{OUT_DIR}/03_joined.tsv",
+    log:
+        f"{LOG_DIR}/join_by_biosample.log",
+    shell:
+        """
+        python3 scripts/join_tables_by_biosample.py \
+            --sra-table {input.sra} --genbank-table {input.genbank} \
+            --out {output} --format tsv &> {log}
+        """
+
+
+# A checkpoint, not a plain rule: its output determines how many downstream
+# assembly/annotation jobs exist, which Snakemake can only know after this
+# actually runs. See aggregate_summary_reports() above.
+checkpoint select_no_genbank:
+    input:
+        f"{OUT_DIR}/03_joined.tsv",
+    output:
+        no_genbank=NO_GENBANK_TSV,
+        with_genbank=f"{OUT_DIR}/with_genbank_samples.tsv",
+    log:
+        f"{LOG_DIR}/select_no_genbank.log",
+    shell:
+        """
+        python3 scripts/select_no_genbank.py \
+            --joined-table {input} \
+            --output-no-genbank {output.no_genbank} \
+            --output-with-genbank {output.with_genbank} &> {log}
+        """
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: BV-BRC assembly + annotation for the runs with no GenBank
+# accession. Structurally the same as the base pipeline's rules (same
+# p3-tools calls, same graceful-skip-on-empty-contigs behavior), just
+# reading its sample list from NO_GENBANK_TSV instead of a hand-maintained
+# samples_tsv, and living under its own results/<run_name>/samples/ so it
+# sits right alongside this run's SRA-selection tables.
+# ---------------------------------------------------------------------------
+
+rule bvbrc_check_login:
+    output:
+        touch(f"{OUT_DIR}/.bvbrc_login_ok"),
+    log:
+        f"{LOG_DIR}/bvbrc_login.log",
+    shell:
+        """
+        p3-whoami > {log} 2>&1
+        STATUS=$?
+        if [ "$STATUS" -ne 0 ] || grep -qi "logged out" {log}; then
+            echo "ERROR: not logged in to BV-BRC. Run 'p3-login <username>' first." >&2
+            cat {log} >&2
+            exit 1
+        fi
+        """
+
+
+rule bvbrc_submit_assembly:
+    input:
+        login=f"{OUT_DIR}/.bvbrc_login_ok",
+    output:
+        jobid=SAMPLES_LOCAL_PREFIX + "{sample}/assembly/job_id.txt",
+        flag=touch(SAMPLES_LOCAL_PREFIX + "{sample}/assembly/.complete"),
+    params:
+        srr=lambda wc: get_sample_field(wc.sample, "srr"),
+        ws_base=WS_BASE,
+        ws_batch_base=WS_SAMPLE_BASE,
+        ws_path=lambda wc: f"{WS_SAMPLE_BASE}/{wc.sample}",
+        local_dir=lambda wc: f"{SAMPLES_LOCAL_PREFIX}{wc.sample}/assembly",
+        strategy=STRATEGY,
+        poll=POLL,
+        timeout=TIMEOUT,
+    log:
+        SAMPLES_LOG_PREFIX + "{sample}/bvbrc_submit_assembly.log",
+    shell:
+        """
+        mkdir -p {params.local_dir}
+
+        # p3-submit-viral-assembly does not create its output workspace
+        # directory itself -- create it (and its parents) first. Errors are
+        # ignored so this is safe to re-run if the folder already exists.
+        p3-mkdir "{params.ws_base}" >> {log} 2>&1 || true
+        p3-mkdir "{params.ws_batch_base}" >> {log} 2>&1 || true
+        p3-mkdir "{params.ws_path}" >> {log} 2>&1 || true
+
+        bash scripts/bvbrc_submit_and_wait.sh \
+            "{output.jobid}" "{params.poll}" "{params.timeout}" "{log}" \
+            p3-submit-viral-assembly \
+                --srr-id "{params.srr}" \
+                --strategy "{params.strategy}" \
+                "{params.ws_path}" assembly
+        """
+
+
+rule bvbrc_fetch_assembly:
+    input:
+        SAMPLES_LOCAL_PREFIX + "{sample}/assembly/.complete",
+    output:
+        directory(SAMPLES_LOCAL_PREFIX + "{sample}/assembly/bvbrc_output"),
+    params:
+        ws_path=lambda wc: f"{WS_SAMPLE_BASE}/{wc.sample}/.assembly",
+        srr=lambda wc: get_sample_field(wc.sample, "srr"),
+    log:
+        SAMPLES_LOG_PREFIX + "{sample}/bvbrc_fetch_assembly.log",
+    shell:
+        """
+        mkdir -p {output}
+        p3-cp -r "ws:{params.ws_path}/" {output} &> {log}
+        rm -f {output}/{params.srr}_1.fastq {output}/{params.srr}_2.fastq
+        rm -rf {output}/{params.srr}
+        """
+
+
+rule pick_contigs:
+    input:
+        SAMPLES_LOCAL_PREFIX + "{sample}/assembly/bvbrc_output",
+    output:
+        SAMPLES_LOCAL_PREFIX + "{sample}/assembly/contigs.fasta",
+    log:
+        SAMPLES_LOG_PREFIX + "{sample}/pick_contigs.log",
+    shell:
+        "python3 scripts/pick_contigs.py {input} {output} &> {log}"
+
+
+rule bvbrc_submit_annotation:
+    input:
+        login=f"{OUT_DIR}/.bvbrc_login_ok",
+        contigs=SAMPLES_LOCAL_PREFIX + "{sample}/assembly/contigs.fasta",
+    output:
+        jobid=SAMPLES_LOCAL_PREFIX + "{sample}/annotation/job_id.txt",
+        flag=touch(SAMPLES_LOCAL_PREFIX + "{sample}/annotation/.complete"),
+    params:
+        ws_batch_base=WS_SAMPLE_BASE,
+        ws_path=lambda wc: f"{WS_SAMPLE_BASE}/{wc.sample}",
+        upload_path=lambda wc: f"{WS_SAMPLE_BASE}/{wc.sample}/uploads",
+        local_dir=lambda wc: f"{SAMPLES_LOCAL_PREFIX}{wc.sample}/annotation",
+        sci_name=lambda wc: get_sample_field(wc.sample, "scientific_name"),
+        ref_virus=lambda wc: get_sample_field(wc.sample, "reference_virus"),
+        taxonomy_id=lambda wc: get_sample_field(wc.sample, "taxonomy_id"),
+        recipe=ANNOTATION_RECIPE,
+        genetic_code=GENETIC_CODE,
+        domain=DOMAIN,
+        public_flag=PUBLIC_FLAG,
+        poll=POLL,
+        timeout=TIMEOUT,
+    log:
+        SAMPLES_LOG_PREFIX + "{sample}/bvbrc_submit_annotation.log",
+    shell:
+        """
+        mkdir -p {params.local_dir}
+
+        if [ ! -s "{input.contigs}" ]; then
+            echo "No assembled contigs available for {wildcards.sample} -- skipping annotation." | tee {log} >&2
+            echo "SKIPPED" > {output.jobid}
+            exit 0
+        fi
+
+        p3-mkdir "{params.ws_batch_base}" >> {log} 2>&1 || true
+        p3-mkdir "{params.ws_path}" >> {log} 2>&1 || true
+        p3-mkdir "{params.upload_path}" >> {log} 2>&1 || true
+        p3-cp -f "{input.contigs}" "ws:{params.upload_path}/contigs.fasta" >> {log} 2>&1
+
+        EXTRA_ARGS=""
+        if [ -n "{params.sci_name}" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --scientific-name \\"{params.sci_name}\\""
+        fi
+        if [ -n "{params.ref_virus}" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --reference-virus \\"{params.ref_virus}\\""
+        fi
+        if [ -n "{params.taxonomy_id}" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --taxonomy-id {params.taxonomy_id}"
+        fi
+        eval bash scripts/bvbrc_submit_and_wait.sh \
+            "{output.jobid}" "{params.poll}" "{params.timeout}" "{log}" \
+            p3-submit-genome-annotation \
+                --overwrite \
+                --contigs-file "ws:{params.upload_path}/contigs.fasta" \
+                --recipe "{params.recipe}" \
+                --genetic-code "{params.genetic_code}" \
+                --domain "{params.domain}" \
+                --index-nowait \
+                {params.public_flag} \
+                $EXTRA_ARGS \
+                "{params.ws_path}" annotation
+        """
+
+
+rule bvbrc_fetch_annotation:
+    input:
+        flag=SAMPLES_LOCAL_PREFIX + "{sample}/annotation/.complete",
+        jobid=SAMPLES_LOCAL_PREFIX + "{sample}/annotation/job_id.txt",
+    output:
+        directory(SAMPLES_LOCAL_PREFIX + "{sample}/annotation/bvbrc_output"),
+    params:
+        ws_path=lambda wc: f"{WS_SAMPLE_BASE}/{wc.sample}/.annotation",
+    log:
+        SAMPLES_LOG_PREFIX + "{sample}/bvbrc_fetch_annotation.log",
+    shell:
+        """
+        mkdir -p {output}
+        if grep -qx "SKIPPED" "{input.jobid}"; then
+            echo "Annotation was skipped for {wildcards.sample}; nothing to fetch." > {log}
+            exit 0
+        fi
+        p3-cp -r "ws:{params.ws_path}/" {output} &> {log}
+        """
+
+
+rule make_summary:
+    input:
+        assembly_dir=SAMPLES_LOCAL_PREFIX + "{sample}/assembly/bvbrc_output",
+        contigs=SAMPLES_LOCAL_PREFIX + "{sample}/assembly/contigs.fasta",
+        annotation_dir=SAMPLES_LOCAL_PREFIX + "{sample}/annotation/bvbrc_output",
+        assembly_jobid=SAMPLES_LOCAL_PREFIX + "{sample}/assembly/job_id.txt",
+        annotation_jobid=SAMPLES_LOCAL_PREFIX + "{sample}/annotation/job_id.txt",
+    output:
+        SAMPLES_LOCAL_PREFIX + "{sample}/summary_report.md",
+    log:
+        SAMPLES_LOG_PREFIX + "{sample}/make_summary.log",
+    shell:
+        "python3 scripts/make_summary.py --sample {wildcards.sample} "
+        "--assembly-dir {input.assembly_dir} --contigs {input.contigs} "
+        "--annotation-dir {input.annotation_dir} "
+        "--assembly-jobid {input.assembly_jobid} --annotation-jobid {input.annotation_jobid} "
+        "--output {output} &> {log}"
+
+
+# ---------------------------------------------------------------------------
+# Publish the SRA-selection reference tables to the BV-BRC workspace, next
+# to where stage 2 puts assembly/annotation output for this run_name.
+# Depends only on stage 1's outputs and a login, not on stage 2 (or on how
+# many samples stage 2 ends up processing), so results/<run_name>/ and
+# workspace_base/<run_name>/ both end up self-contained: the SRA list with
+# and without GenBank accessions, plus whatever assembly/annotation output
+# stage 2 produced.
+# ---------------------------------------------------------------------------
+
+rule publish_sra_lists_to_workspace:
+    input:
+        login=f"{OUT_DIR}/.bvbrc_login_ok",
+        joined=f"{OUT_DIR}/03_joined.tsv",
+        no_genbank=NO_GENBANK_TSV,
+        with_genbank=f"{OUT_DIR}/with_genbank_samples.tsv",
+    output:
+        touch(f"{OUT_DIR}/.sra_lists_published"),
+    params:
+        ws_dir=f"{WS_SAMPLE_BASE}/sra_selection",
+    log:
+        f"{LOG_DIR}/publish_sra_lists_to_workspace.log",
+    shell:
+        """
+        p3-mkdir "{params.ws_dir}" >> {log} 2>&1 || true
+        p3-cp -f {input.joined} "ws:{params.ws_dir}/all_sra_with_genbank_status.tsv" >> {log} 2>&1
+        p3-cp -f {input.no_genbank} "ws:{params.ws_dir}/no_genbank_samples.tsv" >> {log} 2>&1
+        p3-cp -f {input.with_genbank} "ws:{params.ws_dir}/with_genbank_samples.tsv" >> {log} 2>&1
+        echo "Copied SRA-selection reference tables to ws:{params.ws_dir}" >> {log}
+        """

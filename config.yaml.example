@@ -1,0 +1,69 @@
+# Config for the extended pipeline: SRA selection -> BV-BRC assembly ->
+# BV-BRC annotation. Fully independent of ../config.yaml (the base
+# pipeline's config) -- this file has its own bvbrc: section, used only by
+# this pipeline.
+#
+# Copy this file to config.yaml and fill in the placeholders below before
+# running (config.yaml is gitignored so your real values never get
+# committed).
+
+sra_selection:
+  # One run of this pipeline = one "run_name". Keeps separate BioProject
+  # pulls in their own results/<run_name>/ folder instead of overwriting
+  # each other. Override per-run with --config sra_run_name=<name>.
+  run_name: "default"
+
+  # BioProject accession(s) to pull SRA runs for, e.g. ["PRJNA1122849"].
+  # Override per-run with --config sra_bioprojects=PRJNA1,PRJNA2
+  # (comma/space-separated).
+  bioprojects:
+    - "PRJNA1122849"
+
+  # Optional: path to a file with one BioProject accession per line, used in
+  # addition to (or instead of) the list above. Override per-run with
+  # --config sra_bioproject_file=path/to/file.txt
+  bioproject_file: ""
+
+  # Optional SRA publication date filters (YYYY-MM-DD). Leave blank for no
+  # filter. Override per-run with --config sra_mindate=... sra_maxdate=...
+  mindate: ""
+  maxdate: ""
+
+  # Entrez requires a contact email -- required, NCBI will contact this
+  # address if your usage causes problems. Override per-run with
+  # --config sra_email=...
+  email: "you@example.com"
+
+  # Optional NCBI API key -- raises your rate limit, not required. Override
+  # per-run with --config sra_api_key=...
+  api_key: ""
+
+# BV-BRC / p3-tools settings for stage 2 (assembly + annotation). Same
+# shape as ../config.yaml's bvbrc: section, but this is its own independent
+# copy -- editing one does not affect the other.
+bvbrc:
+  # Workspace folder (created if missing) where job outputs go. Full paths
+  # used by this pipeline are {workspace_base}/{run_name}/{sample}/...
+  workspace_base: "/yourusername@bvbrc/home/your_pipeline_folder"
+
+  # Strategy passed to p3-submit-viral-assembly.
+  viral_assembly_strategy: "IRMA"
+
+  # Recipe passed to p3-submit-genome-annotation for the VIGOR4 viral
+  # annotation step.
+  annotation_recipe: "viral-lowvan"
+
+  # Genetic code and domain passed to p3-submit-genome-annotation. BV-BRC's
+  # annotation schema requires "Bacteria" or "Archaea" even for viral
+  # genomes -- "Bacteria" is the correct/expected value here.
+  genetic_code: 11
+  domain: "Bacteria"
+
+  # Whether annotated genomes are submitted with --public.
+  public: true
+
+  # How often (seconds) to poll p3-job-status while waiting for a job.
+  poll_interval_sec: 30
+
+  # Give up waiting after this many seconds.
+  timeout_sec: 21600   # 6 hours
