@@ -9,6 +9,30 @@ Everything it needs lives in this repo: the `Snakefile`, `config.yaml.example`,
 and every script it calls, including the BV-BRC submission helpers. Nothing
 here depends on any other pipeline or repo.
 
+## Prerequisites
+
+Before cloning, you'll need:
+
+- **A [BV-BRC](https://www.bv-brc.org/) account.** BV-BRC is free to sign up
+  for. The pipeline submits assembly/annotation jobs to BV-BRC's servers
+  under your account.
+- **The BV-BRC command line interface (`p3-tools`)**, installed separately --
+  it's not a Python/conda package. Get an installer for your OS from
+  [BV-BRC-CLI releases](https://github.com/BV-BRC/BV-BRC-CLI/releases) and
+  follow BV-BRC's [install docs](https://www.bv-brc.org/docs/cli_tutorial/cli_installation.html).
+  Specifically, `p3-submit-viral-assembly` isn't documented on BV-BRC's
+  public docs site as of writing -- run `p3-submit-viral-assembly --help`
+  after installing to sanity-check its flags against what this pipeline
+  passes it.
+- Log in once per machine: `p3-login <your-username>` (the pipeline checks
+  this and fails fast with a clear message if you're not logged in).
+- **Python 3.8+** with **Snakemake** (`pip install snakemake`) and
+  **biopython** + **pandas** (see Requirements below).
+- **An NCBI Entrez contact email.** NCBI requires this for any automated
+  querying (this is what SRA/GenBank lookups use); it doesn't need to be
+  registered anywhere in advance, just a real address they can reach you at
+  if your usage causes problems.
+
 ## Setup
 
 ```
@@ -19,8 +43,10 @@ cp config.yaml.example config.yaml
 
 Then edit `config.yaml` and fill in: your NCBI Entrez contact email, the
 BioProject accession(s) you want to pull, and your BV-BRC workspace path
-(`bvbrc.workspace_base`). `config.yaml` is gitignored, so your real values
-never get committed.
+(`bvbrc.workspace_base`, e.g. `/yourusername@bvbrc/home/some_folder_name`
+-- it gets created automatically if it doesn't exist). `config.yaml` is
+gitignored, so your real values never get committed if you push changes
+back to a fork.
 
 ## What it does
 
@@ -41,27 +67,42 @@ stops here with a clear error.
 **Step 2 -- assembly + annotation**, for every run with no GenBank
 accession: submit to BV-BRC's IRMA-based Viral Assembly service, pick the
 assembled contigs, submit those to BV-BRC's Genome Annotation service
-(VIGOR4), fetch both, and write a per-sample summary report -- the same
-p3-tools calls and graceful-skip-on-empty-contigs behavior as the base
-pipeline, just running independently here.
+(VIGOR4), fetch both, and write a per-sample summary report. If assembly
+produces no usable contigs for a sample, annotation is skipped for that
+sample only (with a clear note), instead of failing the whole run.
 
 If step 1 finds SRA runs but every one of them already has a GenBank
 accession, step 2 has nothing to do and the pipeline stops there too --
 without ever calling BV-BRC's assembly/annotation services.
 
-Only `scripts/select_no_genbank.py` is new. Everything else is either your
-own script (fetch/biosample/join, used unmodified) or a copy of a script
-already proven out in the base pipeline (`bvbrc_submit_and_wait.sh`,
-`pick_contigs.py`, `make_summary.py`).
-
 ## Requirements
 
 ```
-pip install biopython pandas --break-system-packages   # in the BV-BRC CLI sandbox
-pip install biopython pandas                            # on a normal machine/venv
+pip install snakemake biopython pandas
+```
+
+(If you're running inside BV-BRC's own CLI environment and hit a
+"externally-managed-environment" pip error, add `--break-system-packages`
+to the command above.)
+
+## Quickstart
+
+Putting it all together, end to end:
+
+```
+git clone <this-repo-url>
+cd <repo-folder>
+pip install snakemake biopython pandas
+cp config.yaml.example config.yaml
+# edit config.yaml: set sra_selection.email and bvbrc.workspace_base at minimum
+p3-login <your-bvbrc-username>
+snakemake -n --cores 4 --config sra_bioprojects=PRJNA1122849 sra_run_name=my_first_run   # dry run
+snakemake --cores 4 --keep-going --config sra_bioprojects=PRJNA1122849 sra_run_name=my_first_run
 ```
 
 ## Running -- one command
+
+Once configured, every subsequent run is just:
 
 ```
 snakemake --cores 4 --keep-going --config sra_run_name=flu_2026_08
