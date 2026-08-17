@@ -1,0 +1,79 @@
+# Configuration for the viral SRA -> BV-BRC comprehensive analysis pipeline
+#
+# Copy this file to config.yaml and fill in the placeholders below before
+# running (config.yaml is gitignored so your real values never get
+# committed).
+#
+# Each sample is one SRA run to process. Add as many as you like;
+# `snakemake --cores N` will process them (respecting BV-BRC's per-job concurrency).
+#
+# Note: you do NOT need to download reads or run QC yourself -- BV-BRC's IRMA
+# viral assembly service fetches the reads straight from the given SRA run
+# accession and performs its own internal QC/read filtering as part of
+# IRMA's iterative assembly process.
+#
+# If IRMA assembles zero usable contigs for a sample (e.g. very low coverage),
+# the pipeline does NOT treat that as a hard failure: it skips annotation for
+# that sample, notes it clearly in that sample's summary_report.md, and
+# continues on to the rest of your samples.
+
+# Samples can come from either a TSV file (recommended if you're managing a
+# list of SRA runs) or the inline `samples:` block below.
+#
+# If samples_tsv is set (uncommented), it takes priority and the inline
+# `samples:` block below is ignored. The TSV needs a header row with at
+# least an "srr" column (or "Run" / "sra_accession" -- see README.md);
+# scientific_name / reference_virus / taxonomy_id columns are optional (same
+# meaning as the inline fields below, and safe to leave blank). Extra
+# columns (e.g. from a TSV shared with your other scripts) are ignored. See
+# samples.tsv.example for the format -- copy it to samples.tsv and fill in
+# your own SRA accessions.
+samples_tsv: "samples.tsv"
+
+# Inline alternative to samples_tsv -- only used if samples_tsv above is
+# commented out / removed.
+samples:
+  SRR28752452:
+    srr: SRR28752452          # SRA run accession (SRR/ERR/DRR)
+    scientific_name: "Influenza A virus"   # used to label the BV-BRC annotation job
+    reference_virus: ""       # optional: exact VIGOR_DB reference name (e.g. "Influenza A")
+                              # leave blank to let BV-BRC/VIGOR4 infer it
+    taxonomy_id: 11320        # optional: NCBI taxon id (11320 = Influenza A virus species).
+                              # leave blank ("") to let BV-BRC estimate it
+
+# BV-BRC / p3-tools settings
+bvbrc:
+  # Your BV-BRC username, e.g. "jdoe" (login handle before "@bvbrc").
+  # You must already be logged in via `p3-login <username>` -- this pipeline
+  # does not handle your password.
+  username: "yourusername"
+
+  # Workspace folder (created if missing) where job outputs go.
+  # Full paths used by the pipeline are {workspace_base}/{sample}/...
+  workspace_base: "/yourusername@bvbrc/home/your_pipeline_folder"
+
+  # Strategy passed to p3-submit-viral-assembly. IRMA is currently the only
+  # viral assembly strategy BV-BRC offers, so this should stay "IRMA" unless
+  # BV-BRC adds others later.
+  viral_assembly_strategy: "IRMA"
+
+  # Recipe passed to p3-submit-genome-annotation for the VIGOR4 viral
+  # annotation step.
+  annotation_recipe: "viral-lowvan"
+
+  # Genetic code and domain passed to p3-submit-genome-annotation. BV-BRC's
+  # annotation schema requires a "domain" value of Bacteria or Archaea even
+  # for viral genomes -- "Bacteria" is the correct/expected value here.
+  genetic_code: 11
+  domain: "Bacteria"
+
+  # Whether annotated genomes are submitted with --public (visible to other
+  # BV-BRC users). Set to false to keep them private.
+  public: true
+
+  # How often (seconds) to poll p3-job-status while waiting for a job.
+  poll_interval_sec: 30
+
+  # Give up waiting after this many seconds (jobs that are still queued/running
+  # after this will cause the pipeline to fail loudly rather than hang forever).
+  timeout_sec: 21600   # 6 hours

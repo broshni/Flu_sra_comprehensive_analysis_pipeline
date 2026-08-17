@@ -1,12 +1,15 @@
-# Real config (has your email + BV-BRC workspace path) -- copy
-# config.yaml.example to config.yaml and fill in your own values.
-config.yaml
+# Real configs (contain your email / BV-BRC username / workspace paths) --
+# copy the matching config.yaml.example in each pipeline folder instead.
+sra_selection_pipeline/config.yaml
+assembly_annotation_pipeline/config.yaml
+assembly_annotation_pipeline/samples.tsv
 
 # Pipeline outputs and logs -- regenerated on every run, not source.
-results/
-logs/
+*/results/
+*/logs/
 
 # Snakemake's own bookkeeping.
+*/.snakemake/
 .snakemake/
 
 # Python

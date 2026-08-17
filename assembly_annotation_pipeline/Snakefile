@@ -1,0 +1,370 @@
+"""
+Comprehensive viral SRA analysis pipeline built on BV-BRC (p3-tools CLI).
+
+Pipeline stages per sample:
+  1. Submit the SRA run accession straight to BV-BRC's IRMA-based Viral
+     Assembly service (p3-submit-viral-assembly), wait, fetch results.
+     BV-BRC downloads the reads from SRA and runs IRMA's own internal QC
+     (filtering/trimming/iterative refinement) itself -- no local
+     download or QC step is needed.
+  2. Pick the assembled contigs (IRMA emits one FASTA per genome segment
+     for segmented viruses) and submit them to the BV-BRC Genome
+     Annotation service (VIGOR4 viral annotation), wait, fetch results.
+  3. Build a per-sample summary report linking all key outputs.
+
+Requirements (see README.md for details):
+  - BV-BRC CLI (p3-tools) installed and on PATH, and `p3-login <user>` already run
+  - `p3-submit-viral-assembly` specifically -- this is not (yet) documented on
+    bv-brc.org's public docs site; confirm its exact flags with
+    `p3-submit-viral-assembly --help` on your machine before relying on this
+    pipeline for anything important.
+"""
+
+import csv
+import re
+
+configfile: "config.yaml"
+
+
+def parse_srr_list(value):
+    """Split a comma/space/semicolon separated string of SRA accessions."""
+    return [s for s in re.split(r"[,\s;]+", str(value).strip()) if s]
+
+
+# Column names accepted for the SRA run accession in a samples TSV, checked
+# in this order. "srr" matches this pipeline's own convention; "Run" matches
+# the column name SRA's own metadata export (e.g. the SRA Run Selector
+# "Accession List"/RunInfo table) uses; "sra_accession" matches a common
+# naming convention in other lab scripts. Any of these let a TSV be pointed
+# at directly without renaming its header.
+SRR_COLUMN_CANDIDATES = ["srr", "Run", "sra_accession"]
+
+
+def load_samples_from_tsv(path):
+    """
+    Parse a tab-separated samples file into the same shape as config.yaml's
+    inline `samples:` block. Requires exactly one recognized run-accession
+    column -- "srr" (this pipeline's own convention), "Run" (SRA Run
+    Selector's column name), or "sra_accession" -- checked case-insensitively.
+    Optional columns: scientific_name, reference_virus, taxonomy_id
+    (blank/missing is fine -- same defaults as leaving them out of
+    config.yaml).
+
+    Rows with an empty/missing accession are skipped. Extra columns are
+    ignored, so a TSV built for one of your other scripts (e.g. one with a
+    genbank_accessions column, or a full SRA RunInfo table) can usually be
+    reused as-is.
+    """
+    samples = {}
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        fieldnames = reader.fieldnames or []
+        lower_to_actual = {name.lower(): name for name in fieldnames}
+        srr_column = next(
+            (
+                lower_to_actual[candidate.lower()]
+                for candidate in SRR_COLUMN_CANDIDATES
+                if candidate.lower() in lower_to_actual
+            ),
+            None,
+        )
+        if srr_column is None:
+            raise ValueError(
+                f"{path}: expected a tab-separated file with an 'srr', 'Run', "
+                f"or 'sra_accession' column (found columns: {fieldnames})"
+            )
+        for row in reader:
+            srr = (row.get(srr_column) or "").strip()
+            if not srr:
+                continue
+            samples[srr] = {
+                "srr": srr,
+                "scientific_name": (row.get("scientific_name") or "").strip(),
+                "reference_virus": (row.get("reference_virus") or "").strip(),
+                "taxonomy_id": (row.get("taxonomy_id") or "").strip(),
+            }
+    return samples
+
+
+# Samples can come from three places, checked in this order:
+#   1. `--config srr=SRRxxxxxxx` on the command line -- for a quick one-off
+#      run against a single accession without touching any file. Also
+#      accepts a comma/space-separated list: `--config srr=SRR1,SRR2`. Pair
+#      with `--config scientific_name=... taxonomy_id=...` to apply the same
+#      metadata to every accession in the list.
+#   2. `samples_tsv: <path>` in config.yaml (or `--config samples_tsv=<path>`
+#      to point at a different file for one run) -- a TSV/TXT file with an
+#      `srr` column, one row per sample.
+#   3. the inline `samples:` block in config.yaml -- used only if neither of
+#      the above is set.
+if config.get("srr"):
+    config["samples"] = {
+        srr: {
+            "srr": srr,
+            "scientific_name": config.get("scientific_name", ""),
+            "reference_virus": config.get("reference_virus", ""),
+            "taxonomy_id": config.get("taxonomy_id", ""),
+        }
+        for srr in parse_srr_list(config["srr"])
+    }
+elif config.get("samples_tsv"):
+    config["samples"] = load_samples_from_tsv(config["samples_tsv"])
+
+SAMPLES = list(config["samples"].keys())
+BVBRC = config["bvbrc"]
+WS_BASE = BVBRC["workspace_base"].rstrip("/")
+POLL = BVBRC.get("poll_interval_sec", 30)
+TIMEOUT = BVBRC.get("timeout_sec", 21600)
+STRATEGY = BVBRC.get("viral_assembly_strategy", "IRMA")
+ANNOTATION_RECIPE = BVBRC.get("annotation_recipe", "viral-lowvan")
+GENETIC_CODE = BVBRC.get("genetic_code", 11)
+DOMAIN = BVBRC.get("domain", "Bacteria")
+ANNOTATION_PUBLIC = BVBRC.get("public", True)
+PUBLIC_FLAG = "--public" if ANNOTATION_PUBLIC else ""
+
+# Batch grouping: when more than one sample is being processed in a single
+# run (a comma-separated --config srr=... list, or a multi-row samples_tsv),
+# you must also supply --config batch_name=<name> so that run's outputs get
+# grouped into their own subfolder -- both locally (results/<batch>/<sample>/
+# ..., logs/<batch>/<sample>/...) and in the BV-BRC workspace
+# (workspace_base/<batch>/<sample>/...) -- instead of mixing with other runs'
+# per-sample folders at the top level. Single-accession runs are unaffected
+# and keep writing straight to results/<sample>/... as before.
+BATCH_NAME = str(config.get("batch_name", "")).strip()
+if len(SAMPLES) > 1 and not BATCH_NAME:
+    raise ValueError(
+        "This run resolved more than one sample "
+        f"({len(SAMPLES)}: {', '.join(SAMPLES)}), so you must also supply "
+        "--config batch_name=<name> to group this run's outputs into their "
+        "own folder, e.g.:\n"
+        "  snakemake --cores 4 --config srr=SRR1,SRR2 batch_name=my_batch\n"
+        "  snakemake --cores 4 --config batch_name=my_batch   "
+        "# (samples_tsv/samples: still come from config.yaml)"
+    )
+BATCH_PREFIX = f"{BATCH_NAME}/" if len(SAMPLES) > 1 else ""
+RESULTS_PREFIX = f"results/{BATCH_PREFIX}"
+LOGS_PREFIX = f"logs/{BATCH_PREFIX}"
+WS_SAMPLE_BASE = f"{WS_BASE}/{BATCH_PREFIX}".rstrip("/")
+WS_BATCH_BASE = f"{WS_BASE}/{BATCH_NAME}" if BATCH_PREFIX else None
+
+
+rule all:
+    input:
+        expand(RESULTS_PREFIX + "{sample}/summary_report.md", sample=SAMPLES)
+
+
+# ---------------------------------------------------------------------------
+# 1. BV-BRC: IRMA viral genome assembly (straight from the SRA accession)
+# ---------------------------------------------------------------------------
+
+rule bvbrc_check_login:
+    output:
+        touch("results/.bvbrc_login_ok"),
+    log:
+        "logs/bvbrc_login.log",
+    shell:
+        """
+        p3-whoami > {log} 2>&1
+        STATUS=$?
+        if [ "$STATUS" -ne 0 ] || grep -qi "logged out" {log}; then
+            echo "ERROR: not logged in to BV-BRC. Run 'p3-login <username>' first." >&2
+            cat {log} >&2
+            exit 1
+        fi
+        """
+
+
+rule bvbrc_submit_assembly:
+    input:
+        login="results/.bvbrc_login_ok",
+    output:
+        jobid=RESULTS_PREFIX + "{sample}/assembly/job_id.txt",
+        flag=touch(RESULTS_PREFIX + "{sample}/assembly/.complete"),
+    params:
+        srr=lambda wc: config["samples"][wc.sample]["srr"],
+        ws_base=WS_BASE,
+        ws_batch_base=WS_BATCH_BASE or WS_BASE,
+        ws_path=lambda wc: f"{WS_SAMPLE_BASE}/{wc.sample}",
+        local_dir=lambda wc: f"{RESULTS_PREFIX}{wc.sample}/assembly",
+        strategy=STRATEGY,
+        poll=POLL,
+        timeout=TIMEOUT,
+    log:
+        LOGS_PREFIX + "{sample}/bvbrc_submit_assembly.log",
+    shell:
+        """
+        mkdir -p {params.local_dir}
+
+        # p3-submit-viral-assembly does not create its output workspace
+        # directory itself -- create it (and its parents, including the
+        # batch subfolder if one is in use) first. Errors are ignored so
+        # this is safe to re-run if the folder already exists.
+        p3-mkdir "{params.ws_base}" >> {log} 2>&1 || true
+        p3-mkdir "{params.ws_batch_base}" >> {log} 2>&1 || true
+        p3-mkdir "{params.ws_path}" >> {log} 2>&1 || true
+
+        bash scripts/bvbrc_submit_and_wait.sh \
+            "{output.jobid}" "{params.poll}" "{params.timeout}" "{log}" \
+            p3-submit-viral-assembly \
+                --srr-id "{params.srr}" \
+                --strategy "{params.strategy}" \
+                "{params.ws_path}" assembly
+        """
+
+
+rule bvbrc_fetch_assembly:
+    input:
+        RESULTS_PREFIX + "{sample}/assembly/.complete",
+    output:
+        directory(RESULTS_PREFIX + "{sample}/assembly/bvbrc_output"),
+    params:
+        ws_path=lambda wc: f"{WS_SAMPLE_BASE}/{wc.sample}/.assembly",
+        srr=lambda wc: config["samples"][wc.sample]["srr"],
+    log:
+        LOGS_PREFIX + "{sample}/bvbrc_fetch_assembly.log",
+    shell:
+        """
+        mkdir -p {output}
+        p3-cp -r "ws:{params.ws_path}/" {output} &> {log}
+        # BV-BRC's IRMA job dir includes the raw reads it downloaded from SRA
+        # (e.g. {params.srr}_1.fastq, {params.srr}_2.fastq, and a {params.srr}/
+        # staging folder) -- these are large (100s of MB) and redundant since
+        # they're already in SRA, so drop the local copies once fetched.
+        rm -f {output}/{params.srr}_1.fastq {output}/{params.srr}_2.fastq
+        rm -rf {output}/{params.srr}
+        """
+
+
+rule pick_contigs:
+    input:
+        RESULTS_PREFIX + "{sample}/assembly/bvbrc_output",
+    output:
+        RESULTS_PREFIX + "{sample}/assembly/contigs.fasta",
+    log:
+        LOGS_PREFIX + "{sample}/pick_contigs.log",
+    shell:
+        "python3 scripts/pick_contigs.py {input} {output} &> {log}"
+
+
+# ---------------------------------------------------------------------------
+# 2. BV-BRC: genome annotation (VIGOR4 viral annotation)
+# ---------------------------------------------------------------------------
+
+rule bvbrc_submit_annotation:
+    input:
+        login="results/.bvbrc_login_ok",
+        contigs=RESULTS_PREFIX + "{sample}/assembly/contigs.fasta",
+    output:
+        jobid=RESULTS_PREFIX + "{sample}/annotation/job_id.txt",
+        flag=touch(RESULTS_PREFIX + "{sample}/annotation/.complete"),
+    params:
+        ws_batch_base=WS_BATCH_BASE or WS_BASE,
+        ws_path=lambda wc: f"{WS_SAMPLE_BASE}/{wc.sample}",
+        upload_path=lambda wc: f"{WS_SAMPLE_BASE}/{wc.sample}/uploads",
+        local_dir=lambda wc: f"{RESULTS_PREFIX}{wc.sample}/annotation",
+        sci_name=lambda wc: config["samples"][wc.sample].get("scientific_name", ""),
+        ref_virus=lambda wc: config["samples"][wc.sample].get("reference_virus", ""),
+        taxonomy_id=lambda wc: config["samples"][wc.sample].get("taxonomy_id", ""),
+        recipe=ANNOTATION_RECIPE,
+        genetic_code=GENETIC_CODE,
+        domain=DOMAIN,
+        public_flag=PUBLIC_FLAG,
+        poll=POLL,
+        timeout=TIMEOUT,
+    log:
+        LOGS_PREFIX + "{sample}/bvbrc_submit_annotation.log",
+    shell:
+        """
+        mkdir -p {params.local_dir}
+
+        # If the assembly step produced no usable contigs (e.g. IRMA completed
+        # but assembled zero segments for this sample), don't attempt
+        # annotation -- just note it and let the pipeline move on to the next
+        # sample instead of hard-failing the whole run.
+        if [ ! -s "{input.contigs}" ]; then
+            echo "No assembled contigs available for {wildcards.sample} -- skipping annotation." | tee {log} >&2
+            echo "SKIPPED" > {output.jobid}
+            exit 0
+        fi
+
+        # p3-submit-genome-annotation's output-path (and its own built-in
+        # --workspace-upload-path auto-upload) both require the target
+        # workspace directories to already exist -- creating them ourselves
+        # isn't optional here (including the batch subfolder, if one is in
+        # use). p3-submit-genome-annotation's own upload mechanism has also
+        # proven unreliable even when the directory exists, so instead of
+        # relying on --workspace-upload-path we upload the contigs file
+        # ourselves with p3-cp first and reference it via a ws: path,
+        # matching the known-working approach.
+        p3-mkdir "{params.ws_batch_base}" >> {log} 2>&1 || true
+        p3-mkdir "{params.ws_path}" >> {log} 2>&1 || true
+        p3-mkdir "{params.upload_path}" >> {log} 2>&1 || true
+        p3-cp -f "{input.contigs}" "ws:{params.upload_path}/contigs.fasta" >> {log} 2>&1
+
+        EXTRA_ARGS=""
+        if [ -n "{params.sci_name}" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --scientific-name \\"{params.sci_name}\\""
+        fi
+        if [ -n "{params.ref_virus}" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --reference-virus \\"{params.ref_virus}\\""
+        fi
+        if [ -n "{params.taxonomy_id}" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --taxonomy-id {params.taxonomy_id}"
+        fi
+        eval bash scripts/bvbrc_submit_and_wait.sh \
+            "{output.jobid}" "{params.poll}" "{params.timeout}" "{log}" \
+            p3-submit-genome-annotation \
+                --overwrite \
+                --contigs-file "ws:{params.upload_path}/contigs.fasta" \
+                --recipe "{params.recipe}" \
+                --genetic-code "{params.genetic_code}" \
+                --domain "{params.domain}" \
+                --index-nowait \
+                {params.public_flag} \
+                $EXTRA_ARGS \
+                "{params.ws_path}" annotation
+        """
+
+
+rule bvbrc_fetch_annotation:
+    input:
+        flag=RESULTS_PREFIX + "{sample}/annotation/.complete",
+        jobid=RESULTS_PREFIX + "{sample}/annotation/job_id.txt",
+    output:
+        directory(RESULTS_PREFIX + "{sample}/annotation/bvbrc_output"),
+    params:
+        ws_path=lambda wc: f"{WS_SAMPLE_BASE}/{wc.sample}/.annotation",
+    log:
+        LOGS_PREFIX + "{sample}/bvbrc_fetch_annotation.log",
+    shell:
+        """
+        mkdir -p {output}
+        if grep -qx "SKIPPED" "{input.jobid}"; then
+            echo "Annotation was skipped for {wildcards.sample}; nothing to fetch." > {log}
+            exit 0
+        fi
+        p3-cp -r "ws:{params.ws_path}/" {output} &> {log}
+        """
+
+
+# ---------------------------------------------------------------------------
+# 3. Summary report
+# ---------------------------------------------------------------------------
+
+rule make_summary:
+    input:
+        assembly_dir=RESULTS_PREFIX + "{sample}/assembly/bvbrc_output",
+        contigs=RESULTS_PREFIX + "{sample}/assembly/contigs.fasta",
+        annotation_dir=RESULTS_PREFIX + "{sample}/annotation/bvbrc_output",
+        assembly_jobid=RESULTS_PREFIX + "{sample}/assembly/job_id.txt",
+        annotation_jobid=RESULTS_PREFIX + "{sample}/annotation/job_id.txt",
+    output:
+        RESULTS_PREFIX + "{sample}/summary_report.md",
+    log:
+        LOGS_PREFIX + "{sample}/make_summary.log",
+    shell:
+        "python3 scripts/make_summary.py --sample {wildcards.sample} "
+        "--assembly-dir {input.assembly_dir} --contigs {input.contigs} "
+        "--annotation-dir {input.annotation_dir} "
+        "--assembly-jobid {input.assembly_jobid} --annotation-jobid {input.annotation_jobid} "
+        "--output {output} &> {log}"
