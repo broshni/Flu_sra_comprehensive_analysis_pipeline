@@ -114,6 +114,16 @@ don't need it and keep writing to `results/<sample>/...` directly.
 - `--until <rule>` -- stop after a specific rule, e.g.
   `--until bvbrc_submit_assembly` to only submit assembly jobs and check them
   manually.
+- `--config cleanup_local=true` -- for big batches where local disk space is
+  tight: once a sample's `summary_report.md` is written, delete that
+  sample's local `bvbrc_output/` dirs, `contigs.fasta`, and `job_id.txt`,
+  keeping only `summary_report.md` on disk. Safe because everything deleted
+  is already sitting in your BV-BRC workspace -- re-download anything you
+  need later with `p3-cp -r ws:<workspace_path> <local_dir>`. Off by
+  default, so normal runs keep full local copies. Example:
+  ```
+  snakemake --cores 4 --keep-going --config batch_name=my_batch cleanup_local=true
+  ```
 
 ## 3. Examples end to end
 
@@ -157,3 +167,9 @@ results/<batch_name>/<sample>/
 
 Open `summary_report.md` first for any sample -- it links every other output
 file for that sample.
+
+With `cleanup_local=true`, everything under a sample's folder except
+`summary_report.md` (and a `.cleaned` marker) is deleted once that sample
+finishes -- the links inside `summary_report.md` to `assembly/bvbrc_output/`
+etc. will point to files that are no longer local, but they're still there
+in your BV-BRC workspace.

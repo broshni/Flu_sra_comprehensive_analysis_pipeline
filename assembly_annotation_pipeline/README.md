@@ -102,6 +102,17 @@ Single-accession runs are unaffected and keep writing straight to
 snakemake --cores 4 --keep-going --config samples_tsv=samples.tsv batch_name=flu_panel_2026_08
 ```
 
+**Local disk cleanup for big batches.** Pass `--config cleanup_local=true` to
+delete each sample's local `bvbrc_output/` dirs, `contigs.fasta`, and
+`job_id.txt` as soon as that sample's `summary_report.md` is written, keeping
+only the summary report on disk. Safe because everything deleted is already
+stored in your BV-BRC workspace -- re-download anything you need later with
+`p3-cp -r ws:<workspace_path> <local_dir>`. Off by default. Example:
+
+```
+snakemake --cores 4 --keep-going --config samples_tsv=samples.tsv batch_name=flu_panel_2026_08 cleanup_local=true
+```
+
 Other `config.yaml` fields:
 
 - `samples`: fallback if neither `srr` nor `samples_tsv` is set. One entry per SRA run. Set `srr`, a `scientific_name`, and

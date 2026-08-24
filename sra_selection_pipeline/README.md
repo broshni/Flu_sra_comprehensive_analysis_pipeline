@@ -149,6 +149,18 @@ And `config.yaml`'s `bvbrc:` block controls step 2 -- `workspace_base`
 `annotation_recipe`, `genetic_code`, `domain`, `public`, `poll_interval_sec`,
 `timeout_sec`.
 
+**Local disk cleanup for big BioProject pulls.** Pass
+`--config cleanup_local=true` to delete each sample's local `bvbrc_output/`
+dirs, `contigs.fasta`, and `job_id.txt` as soon as that sample's
+`summary_report.md` is written, keeping only the summary report on disk.
+Safe because everything deleted is already stored in your BV-BRC workspace
+-- re-download anything you need later with
+`p3-cp -r ws:<workspace_path> <local_dir>`. Off by default. Example:
+
+```
+snakemake --cores 4 --keep-going --config sra_run_name=flu_2026_08 cleanup_local=true
+```
+
 ## Outputs
 
 ```
@@ -164,6 +176,11 @@ results/<run_name>/
         ├── annotation/{job_id.txt, bvbrc_output/}
         └── summary_report.md
 ```
+
+With `cleanup_local=true`, each `samples/<SRR...>/` folder is reduced to just
+`summary_report.md` (plus a `.cleaned` marker) once that sample finishes --
+the report's links to `assembly/bvbrc_output/` etc. will point to files that
+are no longer local, but they're still in your BV-BRC workspace.
 
 Every run also uploads `all_sra_with_genbank_status.tsv`,
 `no_genbank_samples.tsv`, and `with_genbank_samples.tsv` to

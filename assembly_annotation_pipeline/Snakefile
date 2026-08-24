@@ -147,10 +147,25 @@ LOGS_PREFIX = f"logs/{BATCH_PREFIX}"
 WS_SAMPLE_BASE = f"{WS_BASE}/{BATCH_PREFIX}".rstrip("/")
 WS_BATCH_BASE = f"{WS_BASE}/{BATCH_NAME}" if BATCH_PREFIX else None
 
+# Opt-in local disk cleanup: --config cleanup_local=true deletes each sample's
+# local bvbrc_output/, contigs.fasta, and job_id.txt once its summary_report.md
+# has been written, keeping only the summary report on disk. Safe because
+# everything deleted is already sitting in the BV-BRC workspace -- re-download
+# with p3-cp if you ever need it again. Off by default so normal runs keep
+# full local copies; turn it on for big batches where local space is tight.
+CLEANUP_LOCAL = str(config.get("cleanup_local", "")).strip().lower() in (
+    "1", "true", "yes",
+)
+
 
 rule all:
     input:
-        expand(RESULTS_PREFIX + "{sample}/summary_report.md", sample=SAMPLES)
+        expand(
+            RESULTS_PREFIX + "{sample}/.cleaned"
+            if CLEANUP_LOCAL
+            else RESULTS_PREFIX + "{sample}/summary_report.md",
+            sample=SAMPLES,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -368,3 +383,36 @@ rule make_summary:
         "--annotation-dir {input.annotation_dir} "
         "--assembly-jobid {input.assembly_jobid} --annotation-jobid {input.annotation_jobid} "
         "--output {output} &> {log}"
+
+
+rule cleanup_local:
+    # Only reached when --config cleanup_local=true (see rule all above).
+    # Deletes each sample's local bvbrc_output/ dirs, contigs.fasta, and
+    # job_id.txt now that they're baked into summary_report.md and still
+    # safely stored in the BV-BRC workspace -- keeps only the summary report
+    # on disk. Re-download anything you need later with:
+    #   p3-cp -r ws:<workspace_path> <local_dir>
+    input:
+        summary=RESULTS_PREFIX + "{sample}/summary_report.md",
+        assembly_dir=RESULTS_PREFIX + "{sample}/assembly/bvbrc_output",
+        annotation_dir=RESULTS_PREFIX + "{sample}/annotation/bvbrc_output",
+    output:
+        touch(RESULTS_PREFIX + "{sample}/.cleaned"),
+    params:
+        sample_dir=lambda wc: f"{RESULTS_PREFIX}{wc.sample}",
+    log:
+        LOGS_PREFIX + "{sample}/cleanup_local.log",
+    shell:
+        """
+        {{
+            echo "Cleaning up local files for {wildcards.sample} -- already stored in the BV-BRC workspace."
+            rm -rf "{params.sample_dir}/assembly/bvbrc_output"
+            rm -rf "{params.sample_dir}/annotation/bvbrc_output"
+            rm -f "{params.sample_dir}/assembly/contigs.fasta"
+            rm -f "{params.sample_dir}/assembly/job_id.txt"
+            rm -f "{params.sample_dir}/assembly/.complete"
+            rm -f "{params.sample_dir}/annotation/job_id.txt"
+            rm -f "{params.sample_dir}/annotation/.complete"
+            echo "Kept: {params.sample_dir}/summary_report.md"
+        }} &> {log}
+        """
