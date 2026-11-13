@@ -185,23 +185,37 @@ results/<sample>/
   intermediate working files, and -- notably -- the raw reads BV-BRC
   downloaded from SRA (`<SRR>_1.fastq`, `<SRR>_2.fastq`, a `<SRR>/` staging
   folder). `scripts/pick_contigs.py` picks the `_all.fasta` file when present
-  (falling back to concatenating the per-segment files itself if not), and
-  the `bvbrc_fetch_assembly` rule deletes the local copies of the raw
-  `<SRR>_*.fastq` files and `<SRR>/` folder right after fetching, since
-  they're large (100s of MB) and already sitting safely in SRA. Check
+  (falling back to concatenating the per-segment files itself if not). Check
   `results/<sample>/assembly/bvbrc_output/` if this picks the wrong thing for
   an unusual output layout.
+- After fetching, the `bvbrc_fetch_assembly` rule tries to delete the local
+  copies of the raw `<SRR>_*.fastq` files and `<SRR>/` folder (100s of MB,
+  already in SRA), but it only looks at the top of `bvbrc_output/`. `p3-cp`
+  puts them one level down, in `bvbrc_output/.assembly/`, so they are usually
+  left in place -- use `cleanup_local=true` or delete them by hand if disk
+  space matters.
 - `p3-submit-viral-assembly` was provided directly rather than pulled from
   BV-BRC's public docs (which only describe the underlying IRMA service
   through its web form, currently marked Beta). If your installed CLI
   version has a different name/flags, update the `p3-submit-viral-assembly`
   call in `Snakefile`'s `bvbrc_submit_assembly` rule accordingly.
 - If IRMA assembles zero usable contigs for a sample, `pick_contigs.py`
-  writes an empty `contigs.fasta` instead of failing, and
+  writes an empty `contigs.fasta` instead of failing (caveat: if no FASTA sits
+  at the top of the assembly output, it searches subfolders, and could pick
+  up IRMA's intermediate files under `IRMA/` instead -- check that sample's
+  `pick_contigs.log`), and
   `bvbrc_submit_annotation` detects that empty file and skips submitting an
   annotation job for that sample -- it writes `SKIPPED` to that sample's
   `annotation/job_id.txt` and moves on. The sample's `summary_report.md`
   notes this clearly instead of silently pretending annotation happened.
+- A BV-BRC job that fails or times out stops that sample (with
+  `--keep-going`, the other samples carry on). Rerunning the same command
+  resubmits only the samples that didn't finish.
+- Editing the `Snakefile` can make Snakemake rerun -- and so resubmit to
+  BV-BRC -- jobs for samples that already finished (Snakemake reruns jobs
+  whose rule code changed). Do a dry run (`-n`) after any edit; if it lists
+  jobs for finished samples with "Code has changed since last execution",
+  add `--rerun-triggers mtime` to the command.
 - BV-BRC also has other virus-specific services worth knowing about if they
   fit your sample better: `p3-submit-sars2-assembly` /
   `p3-submit-sars2-analysis` for SARS-CoV-2 specifically.

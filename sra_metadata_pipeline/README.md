@@ -23,9 +23,11 @@ sample's assembly and subtype are done; it does not wait for the other samples.
 
 ## Requirements
 
-- Snakemake, pandas and openpyxl: `pip install snakemake pandas openpyxl`
+- Snakemake 8 or newer (so `profiles/default` is picked up automatically, see
+  Notes), pandas and openpyxl: `pip install snakemake pandas openpyxl`
 - NCBI E-utilities (`esearch`/`efetch`). Set its folder in `config.yaml` →
-  `metadata.edirect_path`, or leave it blank to use PATH. Setting
+  `metadata.edirect_path`. If that is blank, the script uses `$EDIRECT_PATH`,
+  then `~/edirect` if it exists, then whatever is on PATH. Setting
   `NCBI_API_KEY` in your shell speeds up the lookups.
 - The BV-BRC CLI (`p3-tools`), logged in with `p3-login <username>`.
 
@@ -90,8 +92,13 @@ table (`.tsv`, plus the `.xlsx` if BV-BRC accepts it) is uploaded to
 - **Raw Data**: SRA runinfo merged with the BioSample attributes.
 - **BVBRC**: the BV-BRC metadata columns. `genome_name` looks like
   `Influenza A virus A/<host>/<country>/<isolate>/<year>(H5N1)` and `strain`
-  like `A/<host>/<country>/<isolate>/<year>`; the host is left out for human
-  samples. The last four columns are QC columns: `assembly_status`,
+  like `A/<host>/<country>/<isolate>/<year>`. The host is written exactly as
+  the BioSample gives it (e.g. `CATTLE`, `Bos taurus`) and left out for human
+  samples; missing parts are skipped rather than left as `//`. If the
+  BioSample's `isolate` -- or failing that its `strain` attribute -- is
+  already a full name starting with `A/`, that name is used as the strain
+  instead (minus any trailing `(HxNy)`). `geographic_group` comes from the
+  country via a built-in table. The last four columns are QC columns: `assembly_status`,
   `assembled_segments`, `subtype_source` and `subtype_note`.
 - **Assembly**: each sample's assembled segments and its HA/NA subtypes.
 - **Failed**: only present when an NCBI lookup failed.
@@ -128,11 +135,21 @@ N are known. Filter on `subtype_note` to find the records that need a look.
   Only those samples are resubmitted, and the batch metadata table is rebuilt.
   (Just deleting job_id.txt does not work: Snakemake won't rebuild it while the
   sample's later outputs exist.)
+- Annotated genomes are submitted with `--public` (visible to all BV-BRC
+  users) because `bvbrc.public` is `true` in `config.yaml.example`; set it to
+  `false` to keep them private.
 - The annotation job is labelled with `scientific_name` from `samples.tsv`,
   falling back to `default_scientific_name` ("Influenza A virus"). It is not
   labelled with the metadata `genome_name`.
 - The raw SRA reads BV-BRC downloads into the assembly folder are deleted
   locally after fetching; they are still available in SRA.
+- `scripts/extract_sra_metadata.py` also works on its own, without
+  Snakemake: `python3 scripts/extract_sra_metadata.py ids.txt out.xlsx
+  [--subtype H5N1] [--location country] [--subtype-suffix]` (one SRA id per
+  line; SRX/SRS/SRP ids are expanded to their runs, and a run reached through
+  two ids is only listed once). The subtype is read from the BioSample
+  `serotype`/`subtype`/`strain`/`isolate` fields; forms like `H1N1pdm09` and
+  `H3N2v` count as H1N1 and H3N2.
 - The country -> BV-BRC geographic group table is built into
   `scripts/extract_sra_metadata.py` (`GEOGRAPHIC_GROUPS`); edit it there to add
   countries. Countries missing from it are listed as a warning in

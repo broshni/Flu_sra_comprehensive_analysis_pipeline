@@ -1,59 +1,67 @@
 # Flu SRA Comprehensive Analysis Pipelines
 
-Two independent Snakemake pipelines for taking viral SRA data through
-genome assembly and annotation on [BV-BRC](https://www.bv-brc.org/). They
-share no code and don't call each other -- pick whichever fits what you're
-starting from.
-
-A third pipeline, [`sra_metadata_pipeline/`](sra_metadata_pipeline/), takes
-SRA accessions through NCBI metadata, assembly and annotation. It also fills
-`h_type`/`n_type` in the BV-BRC metadata table from the assembled HA/NA segments.
+Three independent Snakemake pipelines for taking viral (influenza) SRA data
+through genome assembly and annotation on [BV-BRC](https://www.bv-brc.org/).
+They share no code at runtime and don't call each other -- each folder has
+its own `Snakefile`, `config.yaml.example` and copies of every script it
+needs. Pick whichever fits what you're starting from.
 
 ## Which one do I want?
 
-| | [`sra_selection_pipeline/`](sra_selection_pipeline/) | [`assembly_annotation_pipeline/`](assembly_annotation_pipeline/) |
-|---|---|---|
-| **Start from** | A list of NCBI BioProject accessions (optionally filtered by date) | One or more SRA run accessions you already have |
-| **What it figures out for you** | Which SRA runs under those BioProjects don't have a GenBank accession yet -- i.e. which ones are actually worth assembling | Nothing -- you supply the exact samples to run |
-| **What it does** | SRA selection -> assembly -> annotation, one command | Assembly -> annotation, one command |
-| **Use it when** | You're doing ongoing surveillance and want "show me what's new" | You already know exactly which SRA runs you want processed |
+| | [`sra_selection_pipeline/`](sra_selection_pipeline/) | [`assembly_annotation_pipeline/`](assembly_annotation_pipeline/) | [`sra_metadata_pipeline/`](sra_metadata_pipeline/) |
+|---|---|---|---|
+| **Start from** | A list of NCBI BioProject accessions (optionally a date window) | One or more SRA run accessions | One or more SRA run accessions |
+| **What it works out for you** | Which SRA runs under those BioProjects have no GenBank record yet -- i.e. which are worth assembling | Nothing -- you supply the exact samples | The BV-BRC metadata for each run (from NCBI SRA + BioSample), with H/N subtype taken from the assembly |
+| **What it does** | SRA selection -> assembly -> annotation | Assembly -> annotation | NCBI metadata -> assembly -> subtype -> annotation, plus a final metadata table uploaded to BV-BRC |
+| **Use it when** | Ongoing surveillance: "show me what's new" | You know exactly which runs you want, and only need assemblies/annotations | You know which runs you want and also need the BV-BRC metadata table (genome names, h_type/n_type, geography) |
 
-Both submit jobs to BV-BRC's IRMA-based Viral Assembly service and Genome
-Annotation service (VIGOR4) the same way, and produce the same kind of
-per-sample output (assembled contigs, annotation output, a
-`summary_report.md`). The difference is entirely in how the sample list
-gets decided.
+All three submit to BV-BRC's IRMA-based Viral Assembly service and its
+Genome Annotation service (VIGOR4, recipe `viral-lowvan`) the same way, and
+write a `summary_report.md` per sample. Annotated genomes are submitted with
+`--public` by default (`bvbrc.public` in each `config.yaml`).
 
-## Setup (either pipeline)
+## Setup
 
-Both need:
+All three need:
 
 - A [BV-BRC](https://www.bv-brc.org/) account (free) and the BV-BRC CLI
   (`p3-tools`) installed and logged in (`p3-login <username>`) -- see each
   pipeline's own README for install links.
 - Snakemake (`pip install snakemake`).
-- A `config.yaml` you create from that pipeline's `config.yaml.example`
-  (each pipeline's real `config.yaml` is gitignored, so cloning this repo
-  never exposes anyone's actual credentials or workspace paths).
+- A `config.yaml` you create from that pipeline's `config.yaml.example`.
+  Each pipeline's real `config.yaml` (and `samples.tsv`) is gitignored, as are
+  `results/`, `logs/` and `.snakemake/`, so cloning or pushing this repo never
+  exposes anyone's credentials, workspace paths or outputs.
+
+Plus, per pipeline:
+
+- `sra_selection_pipeline`: `pip install biopython pandas`, and an NCBI contact email in `config.yaml`.
+- `sra_metadata_pipeline`: `pip install pandas openpyxl`, and NCBI E-utilities (`esearch`/`efetch`, a.k.a. edirect).
 
 ```
 git clone <this-repo-url>
 cd <repo-folder>
 
-# for BioProject-driven surveillance:
+# BioProject-driven surveillance:
 cd sra_selection_pipeline
-cp config.yaml.example config.yaml
-# edit config.yaml, then:
+cp config.yaml.example config.yaml          # edit: email, bioprojects, workspace_base
 snakemake --cores 4 --keep-going --config sra_run_name=my_first_run
 
-# for a known list of SRA accessions:
+# a known list of SRA accessions, assembly + annotation only:
 cd ../assembly_annotation_pipeline
-cp config.yaml.example config.yaml
-cp samples.tsv.example samples.tsv
-# edit config.yaml and samples.tsv, then:
-snakemake --cores 4 --keep-going
+cp config.yaml.example config.yaml          # edit: username, workspace_base
+cp samples.tsv.example samples.tsv          # list your accessions
+snakemake --cores 4 --keep-going --config batch_name=my_batch
+
+# a known list of SRA accessions, with the BV-BRC metadata table:
+cd ../sra_metadata_pipeline
+cp config.yaml.example config.yaml          # edit: username, workspace_base, edirect_path
+snakemake --cores 4 --keep-going --config srr=SRR1,SRR2 batch_name=my_batch
 ```
 
-Full instructions, all configuration options, and troubleshooting notes are
-in each pipeline's own `README.md` (and `RUNNING.md` for the assembly +
-annotation pipeline's full command reference).
+`batch_name` is required whenever a run has more than one sample (in all
+pipelines except `sra_selection_pipeline`, which uses `sra_run_name`).
+
+Full instructions, all configuration options and caveats are in each
+pipeline's own `README.md` (and `RUNNING.md` for the assembly + annotation
+pipeline's full command reference).

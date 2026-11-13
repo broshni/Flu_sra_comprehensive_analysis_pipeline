@@ -53,16 +53,19 @@ back to a fork.
 **Step 1 -- SRA selection:**
 
 1. **Fetch SRA RunInfo** for a list of BioProject accessions (optionally
-   filtered by publication date range) -- `scripts/fetch_sra_runs_by_bioproject.py`.
+   limited to a date window, see `mindate` / `maxdate` below) --
+   `scripts/fetch_sra_runs_by_bioproject.py`.
 2. **Look up linked GenBank records** for each run's BioSample --
    `scripts/biosample_to_genbank.py`.
 3. **Join the two tables** on BioSample -- `scripts/join_tables_by_biosample.py`.
 4. **Split into runs with vs. without a linked GenBank accession** --
-   `scripts/select_no_genbank.py` (new -- automates the step you were doing
-   by hand).
+   `scripts/select_no_genbank.py`.
 
-If zero SRA runs are found for any of the given BioProjects, the pipeline
-stops here with a clear error.
+If none of the given BioProjects return any SRA runs at all, the pipeline
+stops here with a clear error. (A BioProject that returns nothing is skipped
+as long as at least one other one returns runs.) If runs are found but none
+fall inside the date window, that is not an error: step 1 writes header-only
+tables and step 2 has nothing to do.
 
 **Step 2 -- assembly + annotation**, for every run with no GenBank
 accession: submit to BV-BRC's IRMA-based Viral Assembly service, pick the
@@ -133,7 +136,12 @@ Edit `config.yaml`'s `sra_selection:` block:
 - `bioprojects`: list of BioProject accessions, e.g. `["PRJNA1122849"]`.
 - `bioproject_file`: optional, a file with one BioProject per line, used in
   addition to (or instead of) `bioprojects`.
-- `mindate` / `maxdate`: optional SRA publication date filters (`YYYY-MM-DD`).
+- `mindate` / `maxdate`: optional date window (`YYYY-MM-DD`, inclusive). It
+  is sent to NCBI as a `[PDAT]` range, but NCBI's range alone did not
+  reliably narrow results, so every returned run is also checked against its
+  RunInfo `ReleaseDate`; runs outside the window, or with no `ReleaseDate`,
+  are dropped. `logs/<run_name>/fetch_sra_runinfo.log` shows NCBI's reading
+  of the query and how many runs the date filter kept.
 - `email`: required by NCBI Entrez -- set this to your own address.
 - `api_key`: optional NCBI API key.
 
@@ -170,6 +178,7 @@ results/<run_name>/
 ├── 03_joined.tsv                    # 01 + 02 joined on BioSample
 ├── no_genbank_samples.tsv           # runs with NO GenBank accession -- what step 2 processes
 ├── with_genbank_samples.tsv         # runs excluded because one already exists
+├── ncbi_cache/                      # raw NCBI responses written by step 1
 └── samples/
     └── <SRR...>/
         ├── assembly/{job_id.txt, contigs.fasta, bvbrc_output/}
@@ -192,14 +201,37 @@ went in and which were excluded, and why.
 
 ## Notes / caveats
 
-- If a BioProject returns zero SRA runs, `fetch_sra_runs_by_bioproject.py`
+- If none of the BioProjects return SRA runs, `fetch_sra_runs_by_bioproject.py`
   writes a genuinely empty output file, which the pipeline detects and stops
   on with a clear error (rather than letting the next step fail with a
-  confusing pandas error). Double check the BioProject accession before
+  confusing pandas error). Double check the BioProject accessions before
   rerunning.
-- `biosample_to_genbank.py` makes one NCBI round trip per unique BioSample,
-  so a BioProject with hundreds of samples will take a while and is worth an
-  `--api-key` (NCBI's rate limit is much lower without one).
+- `biosample_to_genbank.py` makes a few NCBI requests per unique BioSample
+  (search, link, summary), so a BioProject with hundreds of samples will take
+  a while and is worth an `api_key` (NCBI's rate limit is much lower without
+  one).
+- **A failed GenBank lookup counts as "no GenBank record".** If NCBI errors
+  for a BioSample (rate limit, timeout), `biosample_to_genbank.py` logs
+  `Error processing <BioSample>` and moves on without retrying, so that
+  sample's runs land in `no_genbank_samples.tsv` and get assembled. Check
+  `logs/<run_name>/biosample_to_genbank.log` for those lines before trusting
+  step 2's sample list on a large pull.
+- **Each `run_name` is independent.** A run that still has no GenBank record
+  is assembled (and, with `public: true`, published) again by every new
+  `run_name` whose BioProjects/date window include it -- BV-BRC assemblies
+  don't create GenBank records. Use non-overlapping date windows for
+  recurring pulls.
+- Re-running an existing `run_name` with the same settings does not re-query
+  NCBI (step 1's outputs already exist); change the settings or use a new
+  `run_name` for a fresh pull.
+- The `ncbi_cache/` folder does not currently get reused between runs (its
+  file names are not stable from one Python process to the next), so it only
+  grows; it is safe to delete.
+- After fetching the assembly, the pipeline tries to delete the raw reads
+  BV-BRC downloaded from SRA (`<SRR>_1.fastq`, `<SRR>_2.fastq`, `<SRR>/`), but
+  it only looks at the top of `bvbrc_output/`. `p3-cp` puts them one level
+  down, in `bvbrc_output/.assembly/`, so they are usually left in place -- use
+  `cleanup_local=true` or delete them by hand if disk space matters.
 - `select_no_genbank.py` treats a run as "no GenBank accession" if the
   joined table's `genbank_accessions` field is empty or missing --
   double-check `03_joined.tsv` by eye the first time you run a new
@@ -209,6 +241,26 @@ went in and which were excluded, and why.
   where every SRA run already has one (step 2 correctly does nothing), and a
   run where the BioProjects return zero SRA runs at all (hard stop with a
   clear error).
+
+## Standalone helper: `scripts/sra_genbank_lookup.py`
+
+Not part of the Snakefile (yet). A faster, more careful version of the
+GenBank check for a table you already have: it reads an xlsx/csv/tsv with a
+run column and a BioSample column, checks NCBI both ways (BioSample ->
+nuccore and SRA run -> nuccore) in batches of 100 with retries, and marks
+every row `genbank_lookup = ok` or `failed`, so failed lookups are never
+mistaken for "no GenBank record".
+
+```
+python3 scripts/sra_genbank_lookup.py runs.xlsx --sheet "Raw Data" --email you@example.com [--api-key KEY] [--limit 20]
+# re-check only the rows that failed last time:
+python3 scripts/sra_genbank_lookup.py runs.xlsx --email you@example.com --only-failed runs_genbank.tsv
+```
+
+Writes `<input>_genbank.xlsx` and `<input>_genbank.tsv` next to the input
+(or `--out <prefix>`), adding `genbank_accessions`, `genbank_titles`,
+`genbank_dates`, `genbank_n_records`, `genbank_found_via` and
+`genbank_lookup`. Needs biopython, pandas and openpyxl.
 
 ## Adding more modules
 
