@@ -5,6 +5,10 @@ genome assembly and annotation on [BV-BRC](https://www.bv-brc.org/). They
 share no code and don't call each other -- pick whichever fits what you're
 starting from.
 
+A third pipeline, [`sra_metadata_pipeline/`](sra_metadata_pipeline/), takes
+SRA accessions through NCBI metadata, assembly and annotation. It also fills
+`h_type`/`n_type` in the BV-BRC metadata table from the assembled HA/NA segments.
+
 ## Which one do I want?
 
 | | [`sra_selection_pipeline/`](sra_selection_pipeline/) | [`assembly_annotation_pipeline/`](assembly_annotation_pipeline/) |

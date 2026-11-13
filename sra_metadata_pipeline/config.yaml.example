@@ -1,0 +1,40 @@
+# SRA -> metadata -> BV-BRC assembly -> subtype -> annotation pipeline
+# Copy to config.yaml and fill in your values (config.yaml is gitignored).
+
+# Samples, in priority order:
+#   1. --config srr=SRR1,SRR2            (command line)
+#   2. samples_tsv                        (TSV with an srr / Run / sra_accession column)
+#   3. the inline samples: block below
+samples_tsv: "samples.tsv"
+
+samples:
+  SRR28752452:
+    srr: SRR28752452
+    scientific_name: "Influenza A virus"   # label for the BV-BRC annotation job
+    reference_virus: ""                    # optional exact VIGOR_DB reference, e.g. "Influenza A"
+    taxonomy_id: 11320                     # optional NCBI taxon id ("" to let BV-BRC infer)
+
+# Annotation label used when a sample has no scientific_name.
+default_scientific_name: "Influenza A virus"
+
+# Local disk: false (default) = downloaded BV-BRC outputs are deleted once each
+# sample is finished; everything stays in the workspace. true = keep local copies.
+keep_local: false
+
+# NCBI metadata step (needs NCBI E-utilities / edirect: esearch + efetch).
+metadata:
+  # Folder holding esearch/efetch. Leave "" to use whatever is on PATH.
+  # Set NCBI_API_KEY in your shell for faster lookups.
+  edirect_path: "/Users/yourusername/edirect"
+
+bvbrc:
+  username: "yourusername"
+  # Outputs go to {workspace_base}/{batch_name}/{SRR}/...
+  workspace_base: "/yourusername@bvbrc/home/sra_metadata_pipeline"
+  viral_assembly_strategy: "IRMA"
+  annotation_recipe: "viral-lowvan"
+  genetic_code: 11
+  domain: "Bacteria"        # BV-BRC requires Bacteria/Archaea even for viruses
+  public: true
+  poll_interval_sec: 30
+  timeout_sec: 21600        # 6 hours
