@@ -121,10 +121,17 @@ def aggregate_genbank(genbank_df: pd.DataFrame, gb_biosample_col: str, gb_access
     if gb_date_col is not None and gb_date_col in grouped.columns:
         grouped['genbank_dates'] = grouped[gb_date_col]
         # include date in the combined record
-        grouped['genbank_records'] = grouped.apply(lambda r: combine_row(r[gb_accession_col], r[gb_title_col], r[gb_date_col]), axis=1)
+        # list comprehension, not DataFrame.apply: apply on an empty frame returns a
+        # DataFrame and this assignment crashes when no BioSample has a record
+        grouped['genbank_records'] = [
+            combine_row(a, t, d)
+            for a, t, d in zip(grouped[gb_accession_col], grouped[gb_title_col], grouped[gb_date_col])
+        ]
     else:
         grouped['genbank_dates'] = ''
-        grouped['genbank_records'] = grouped.apply(lambda r: combine_row(r[gb_accession_col], r[gb_title_col], ''), axis=1)
+        grouped['genbank_records'] = [
+            combine_row(a, t, '') for a, t in zip(grouped[gb_accession_col], grouped[gb_title_col])
+        ]
 
     # include aggregated date sources if present
     if gb_date_source_col and gb_date_source_col in grouped.columns:

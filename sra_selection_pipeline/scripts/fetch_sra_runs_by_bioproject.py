@@ -20,6 +20,17 @@ Example:
         --cache-dir cache_ncbi
 
 The script uses Biopython Entrez and includes a small disk cache to avoid repeated NCBI requests.
+
+Date filtering (--sra-mindate / --sra-maxdate, inclusive, YYYY-MM-DD):
+  1. The window is sent to NCBI as a [PDAT] range in the YYYY/MM/DD form Entrez
+     expects, and NCBI's own reading of the query (QueryTranslation) is logged
+     so you can see whether it was applied.
+  2. Every returned row is then checked locally against its RunInfo
+     ReleaseDate, and rows outside the window (or with no ReleaseDate) are
+     dropped. This is the authoritative filter: earlier runs showed the
+     NCBI-side range alone did not narrow results.
+  If no run falls inside the window, a header-only file is written, so a
+  quiet week flows through the pipeline as "nothing to do" instead of an error.
 """
 
 from __future__ import annotations
@@ -30,7 +41,9 @@ import io
 import json
 import os
 import sys
+import re
 import time
+from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -72,12 +85,27 @@ class NCBIClient:
         # sleep shorter when API key present
         self.sleep_seconds = 0.34 if api_key else 1.5
 
+    @staticmethod
+    def _log_search(result) -> None:
+        translation = result.get("QueryTranslation", "")
+        print(f"[INFO]   NCBI query translation: {translation}")
+        warnings = result.get("WarningList") or {}
+        for key in ("PhraseIgnored", "QuotedPhraseNotFound", "OutputMessage"):
+            for msg in warnings.get(key, []) or []:
+                print(f"[WARN]   NCBI {key}: {msg}")
+        errors = result.get("ErrorList") or {}
+        for key, msgs in errors.items():
+            for msg in msgs or []:
+                print(f"[WARN]   NCBI {key}: {msg}")
+
     def esearch_ids(self, db: str, term: str, retmax: int = 100000) -> List[str]:
         cache_key = f"esearch|db={db}|term={term}|retmax={retmax}"
         cached = self.cache.get_text("esearch", cache_key, ".json")
         if cached:
             try:
-                return json.loads(cached).get("IdList", [])
+                result = json.loads(cached)
+                self._log_search(result)
+                return result.get("IdList", [])
             except Exception:
                 pass
 
@@ -88,6 +116,7 @@ class NCBIClient:
                 with Entrez.esearch(db=db, term=term, retmax=retmax, retmode="xml") as handle:
                     result = Entrez.read(handle)
                 self.cache.set_text("esearch", cache_key, json.dumps(result), ".json")
+                self._log_search(result)
                 return result.get("IdList", [])
             except Exception as exc:
                 last_err = exc
@@ -129,20 +158,69 @@ class NCBIClient:
 
 DEFAULT_COLUMNS = None  # if None keep whatever columns appear in RunInfo
 
+_DATE_RE = re.compile(r"^\s*(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s*$")
 
-def fetch_runinfo_for_bioprojects(ncbi: NCBIClient, bioprojects: List[str], sra_mindate: Optional[str], sra_maxdate: Optional[str]) -> List[Dict[str, str]]:
+
+def parse_date_arg(value: Optional[str], label: str) -> Optional[date]:
+    """Accept YYYY-MM-DD (or YYYY/MM/DD); None/blank means no bound."""
+    if value is None or not str(value).strip():
+        return None
+    m = _DATE_RE.match(str(value))
+    if not m:
+        sys.exit(f"ERROR: {label} '{value}' is not a date in YYYY-MM-DD form")
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError as exc:
+        sys.exit(f"ERROR: {label} '{value}' is not a valid date ({exc})")
+
+
+def pdat_term(mindate: Optional[date], maxdate: Optional[date]) -> Optional[str]:
+    """Entrez [PDAT] range clause, dates in the YYYY/MM/DD form Entrez expects."""
+    if not mindate and not maxdate:
+        return None
+    lo = mindate.strftime("%Y/%m/%d") if mindate else "1900/01/01"
+    hi = maxdate.strftime("%Y/%m/%d") if maxdate else "3000/12/31"
+    return f'("{lo}"[PDAT] : "{hi}"[PDAT])'
+
+
+def release_date(row: Dict[str, str]) -> Optional[date]:
+    raw = (row.get("ReleaseDate") or "").strip()
+    try:
+        return datetime.strptime(raw[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def filter_by_release_date(rows: List[Dict[str, str]], mindate: Optional[date], maxdate: Optional[date]) -> List[Dict[str, str]]:
+    """Keep rows whose RunInfo ReleaseDate is inside [mindate, maxdate]."""
+    if not mindate and not maxdate:
+        return rows
+    kept, outside, undated = [], 0, 0
+    for row in rows:
+        d = release_date(row)
+        if d is None:
+            undated += 1
+        elif (mindate and d < mindate) or (maxdate and d > maxdate):
+            outside += 1
+        else:
+            kept.append(row)
+    window = f"{mindate or 'any'} .. {maxdate or 'any'}"
+    print(f"[INFO] ReleaseDate filter {window}: kept {len(kept)} of {len(rows)} rows "
+          f"({outside} outside the window, {undated} with no ReleaseDate)")
+    return kept
+
+
+def fetch_runinfo_for_bioprojects(ncbi: NCBIClient, bioprojects: List[str], sra_mindate: Optional[date], sra_maxdate: Optional[date]) -> List[Dict[str, str]]:
     all_rows: List[Dict[str, str]] = []
 
     for bp in bioprojects:
         print(f"[INFO] Searching SRA runs for BioProject: {bp}")
         term_parts = [f'"{bp}"[BioProject]']
-        if sra_mindate and sra_maxdate:
-            term_parts.append(f'("{sra_mindate}"[PDAT] : "{sra_maxdate}"[PDAT])')
-        elif sra_mindate:
-            term_parts.append(f'("{sra_mindate}"[PDAT] : "3000"[PDAT])')
-        elif sra_maxdate:
-            term_parts.append(f'("1900"[PDAT] : "{sra_maxdate}"[PDAT])')
+        date_clause = pdat_term(sra_mindate, sra_maxdate)
+        if date_clause:
+            term_parts.append(date_clause)
         term = " AND ".join(term_parts)
+        print(f"[INFO]   Query: {term}")
 
         ids = ncbi.esearch_ids("sra", term, retmax=100000)
         print(f"[INFO]   Found {len(ids)} SRA ids for {bp}")
@@ -166,9 +244,18 @@ def fetch_runinfo_for_bioprojects(ncbi: NCBIClient, bioprojects: List[str], sra_
     return all_rows
 
 
-def write_output(rows: List[Dict[str, str]], out_path: str, fmt: str) -> None:
+def write_output(rows: List[Dict[str, str]], out_path: str, fmt: str, header: Optional[List[str]] = None) -> None:
     if not rows:
-        # write an empty file with no rows
+        if header:
+            # NCBI returned runs but none fall inside the date window: write the
+            # header only, so downstream steps see "0 runs" rather than a
+            # missing/blank file.
+            delimiter = "\t" if fmt == "tsv" else ","
+            with open(out_path, "w", encoding="utf-8", newline="") as fh:
+                csv.writer(fh, delimiter=delimiter).writerow(header)
+            print(f"[INFO] No runs inside the date window; wrote header-only {out_path}")
+            return
+        # NCBI returned nothing at all: write an empty file
         open(out_path, "w", encoding="utf-8").close()
         print(f"[INFO] Wrote empty output to {out_path}")
         return
@@ -232,8 +319,15 @@ def main():
     cache = DiskCache(args.cache_dir)
     ncbi = NCBIClient(args.email, args.api_key, cache)
 
-    rows = fetch_runinfo_for_bioprojects(ncbi, bps, args.sra_mindate, args.sra_maxdate)
-    write_output(rows, args.output, args.format)
+    mindate = parse_date_arg(args.sra_mindate, "--sra-mindate")
+    maxdate = parse_date_arg(args.sra_maxdate, "--sra-maxdate")
+    if mindate and maxdate and mindate > maxdate:
+        sys.exit(f"ERROR: --sra-mindate {mindate} is after --sra-maxdate {maxdate}")
+
+    rows = fetch_runinfo_for_bioprojects(ncbi, bps, mindate, maxdate)
+    header = list(rows[0].keys()) if rows else None
+    rows = filter_by_release_date(rows, mindate, maxdate)
+    write_output(rows, args.output, args.format, header=header)
 
 
 if __name__ == "__main__":
