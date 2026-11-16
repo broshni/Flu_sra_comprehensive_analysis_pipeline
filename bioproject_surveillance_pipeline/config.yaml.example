@@ -1,0 +1,54 @@
+# BioProject surveillance pipeline: BioProjects -> SRA runs with no GenBank record
+# -> NCBI metadata -> BV-BRC assembly -> subtype -> metadata table -> annotation.
+#
+# Copy to config.yaml and fill in your values (config.yaml is gitignored).
+# Every sra_selection setting can be overridden per run with --config sra_<name>=...
+# e.g. --config sra_run_name=flu_2026_11_w2 sra_mindate=2026-11-08 sra_maxdate=2026-11-14
+
+sra_selection:
+  # One name per pull. Outputs go to results/<run_name>/ and
+  # {workspace_base}/<run_name>/ on BV-BRC. Required.
+  run_name: "flu_2026_11_w1"
+
+  # BioProject accession(s) to pull SRA runs from (list, or --config
+  # sra_bioprojects=PRJNA1,PRJNA2).
+  bioprojects:
+    - "PRJNA1122849"
+
+  # Optional: a file with one BioProject accession per line, used as well.
+  bioproject_file: ""
+
+  # Publication date window (YYYY-MM-DD, inclusive). Leave blank for no limit.
+  # Runs are kept only if their SRA ReleaseDate falls inside it.
+  mindate: ""
+  maxdate: ""
+
+  # Required by NCBI: a contact email address.
+  email: "you@example.com"
+
+  # Optional NCBI API key (higher rate limit; used for every NCBI step).
+  api_key: ""
+
+# NCBI metadata step (needs NCBI E-utilities / edirect: esearch + efetch).
+metadata:
+  # Folder holding esearch/efetch. Blank = $EDIRECT_PATH, then ~/edirect, then PATH.
+  edirect_path: ""
+
+# Annotation label for a run whose SRA record has no ScientificName.
+default_scientific_name: "Influenza A virus"
+
+# Local disk: false (default) = downloaded BV-BRC outputs are deleted once each
+# run is finished; everything stays in the workspace. true = keep local copies.
+keep_local: false
+
+bvbrc:
+  username: "yourusername"
+  # Outputs go to {workspace_base}/{run_name}/{SRR}/...
+  workspace_base: "/yourusername@bvbrc/home/flu_surveillance"
+  viral_assembly_strategy: "IRMA"
+  annotation_recipe: "viral-lowvan"
+  genetic_code: 11
+  domain: "Bacteria"        # BV-BRC requires Bacteria/Archaea even for viruses
+  public: true              # annotated genomes are visible to all BV-BRC users
+  poll_interval_sec: 30
+  timeout_sec: 21600        # 6 hours

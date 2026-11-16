@@ -5,6 +5,7 @@ assembly_annotation_pipeline/config.yaml
 assembly_annotation_pipeline/samples.tsv
 sra_metadata_pipeline/config.yaml
 sra_metadata_pipeline/samples.tsv
+bioproject_surveillance_pipeline/config.yaml
 
 # Pipeline outputs and logs -- regenerated on every run, not source.
 */results/

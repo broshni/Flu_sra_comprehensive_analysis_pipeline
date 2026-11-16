@@ -1,0 +1,614 @@
+"""
+BioProject surveillance pipeline: BioProjects -> SRA runs with no GenBank record
+-> NCBI metadata -> BV-BRC assembly -> subtype -> metadata table -> annotation.
+
+One command per run_name:
+  1. SRA selection
+     a. SRA RunInfo for the BioProjects, limited to a publication date window
+        (scripts/fetch_sra_runs_by_bioproject.py).
+     b. GenBank (nuccore) records linked to each run's BioSample
+        (scripts/biosample_to_genbank.py) -- retried, and the run stops rather
+        than guessing if a lookup keeps failing.
+     c. Join the GenBank records back onto the SRA runs by BioSample
+        (scripts/join_tables_by_biosample.py).
+     d. Keep the runs with no GenBank record (scripts/select_no_genbank.py).
+        This is a checkpoint: the sample list for everything below is only
+        known once it has run.
+  2. NCBI metadata for the selected runs (SRA runinfo + BioSample via edirect)
+     -> the BV-BRC metadata table (scripts/extract_sra_metadata.py).
+  3. Per run: BV-BRC IRMA assembly, pick the contigs, read the HA/NA subtype
+     from the assembled segments (scripts/assembly_subtype.py).
+  4. Final metadata table with assembly-derived h_type/n_type, subtype and
+     genome_name (scripts/finalize_metadata.py), uploaded to BV-BRC.
+  5. Per run: BV-BRC genome annotation (VIGOR4, recipe viral-lowvan) and a
+     summary report, uploaded to BV-BRC.
+
+Outputs: results/<run_name>/{selection,metadata,samples/<SRR>}/ locally and
+{workspace_base}/<run_name>/ on BV-BRC. See README.md.
+"""
+
+import csv
+import os
+import re
+import sys
+
+configfile: "config.yaml"
+
+SCRIPTS = os.path.join(workflow.basedir, "scripts")
+SEL = config.get("sra_selection", {}) or {}
+META = config.get("metadata", {}) or {}
+BVBRC = config.get("bvbrc", {}) or {}
+
+SRA_RUN_RE = re.compile(r"^[SED]RR\d+$")
+
+wildcard_constraints:
+    sample=r"[SED]RR\d+",
+
+
+def parse_list(value):
+    """Split a comma/space/semicolon separated string, or pass a list through."""
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return [s for s in re.split(r"[,\s;]+", str(value).strip()) if s]
+
+
+def setting(name, default=""):
+    """--config sra_<name>=... overrides sra_selection.<name> in config.yaml."""
+    return config.get(f"sra_{name}", SEL.get(name, default))
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+RUN = str(setting("run_name", "") or "").strip()
+if not RUN:
+    raise ValueError("Set sra_selection.run_name in config.yaml or pass --config sra_run_name=<name> "
+                     "(one name per pull, e.g. flu_2026_11_w1).")
+if not re.fullmatch(r"[A-Za-z0-9._-]+", RUN):
+    raise ValueError(f"run_name '{RUN}' may only contain letters, digits, '.', '_' and '-'")
+
+BIOPROJECTS = parse_list(setting("bioprojects", []))
+BIOPROJECT_FILE = str(setting("bioproject_file", "") or "").strip()
+MINDATE = str(setting("mindate", "") or "").strip()
+MAXDATE = str(setting("maxdate", "") or "").strip()
+EMAIL = str(setting("email", "") or "").strip()
+API_KEY = str(setting("api_key", "") or "").strip()
+
+if not BIOPROJECTS and not BIOPROJECT_FILE:
+    raise ValueError("No BioProjects: set sra_selection.bioprojects (or bioproject_file) in config.yaml, "
+                     "or pass --config sra_bioprojects=PRJNA1,PRJNA2")
+if not EMAIL or EMAIL == "you@example.com":
+    raise ValueError("sra_selection.email is required (NCBI asks for a contact address) -- "
+                     "set it in config.yaml or pass --config sra_email=...")
+
+WS_BASE = str(BVBRC.get("workspace_base", "")).rstrip("/")
+if not WS_BASE or "yourusername" in WS_BASE:
+    raise ValueError("Set bvbrc.workspace_base in config.yaml, e.g. /<username>@bvbrc/home/flu_surveillance")
+WS_RUN = f"{WS_BASE}/{RUN}"
+POLL = BVBRC.get("poll_interval_sec", 30)
+TIMEOUT = BVBRC.get("timeout_sec", 21600)
+STRATEGY = BVBRC.get("viral_assembly_strategy", "IRMA")
+ANNOTATION_RECIPE = BVBRC.get("annotation_recipe", "viral-lowvan")
+GENETIC_CODE = BVBRC.get("genetic_code", 11)
+DOMAIN = BVBRC.get("domain", "Bacteria")
+PUBLIC_FLAG = "--public" if BVBRC.get("public", True) else ""
+DEFAULT_SCI_NAME = config.get("default_scientific_name", "Influenza A virus")
+
+EDIRECT = str(config.get("edirect_path", META.get("edirect_path", "")) or "")
+# edirect reads NCBI_API_KEY from the environment
+EDIRECT_ENV = f"NCBI_API_KEY={API_KEY} " if API_KEY else ""
+
+# By default the downloaded BV-BRC outputs (assembly/annotation folders, contigs.fasta)
+# are temporary: Snakemake deletes them once the last step that needs them has run.
+# Everything stays in the BV-BRC workspace. --config keep_local=true keeps local copies.
+KEEP_LOCAL = str(config.get("keep_local", False)).strip().lower() in ("1", "true", "yes")
+
+
+def local_copy(path):
+    return path if KEEP_LOCAL else temp(path)
+
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+OUT_DIR = f"results/{RUN}"
+LOG_DIR = f"logs/{RUN}"
+SEL_DIR = f"{OUT_DIR}/selection"
+META_DIR = f"{OUT_DIR}/metadata"
+NO_GENBANK_TSV = f"{SEL_DIR}/no_genbank_samples.tsv"
+WITH_GENBANK_TSV = f"{SEL_DIR}/with_genbank_samples.tsv"
+METADATA_XLSX = f"{META_DIR}/{RUN}_metadata.xlsx"
+METADATA_TSV = f"{META_DIR}/{RUN}_metadata.tsv"
+LOGIN_OK = f"{OUT_DIR}/.bvbrc_login_ok"
+SAMPLE_DIR = f"{OUT_DIR}/samples/{{sample}}"
+SAMPLE_LOG = f"{LOG_DIR}/samples/{{sample}}"
+
+FETCH_EXTRA = []
+if BIOPROJECT_FILE:
+    FETCH_EXTRA += ["--bioproject-file", BIOPROJECT_FILE]
+if API_KEY:
+    FETCH_EXTRA += ["--api-key", API_KEY]
+if MINDATE:
+    FETCH_EXTRA += ["--sra-mindate", MINDATE]
+if MAXDATE:
+    FETCH_EXTRA += ["--sra-maxdate", MAXDATE]
+
+
+# ---------------------------------------------------------------------------
+# Sample list (known only after the select_no_genbank checkpoint)
+# ---------------------------------------------------------------------------
+
+def read_selected(path):
+    """{SRR: {scientific_name, taxonomy_id}} from select_no_genbank.py's output (Run column)."""
+    samples = {}
+    if not os.path.exists(path):
+        return samples
+    with open(path, newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh, delimiter="\t"):
+            srr = (row.get("Run") or "").strip()
+            if SRA_RUN_RE.match(srr):
+                samples[srr] = {
+                    "scientific_name": (row.get("scientific_name") or "").strip(),
+                    "taxonomy_id": (row.get("taxonomy_id") or "").strip(),
+                }
+    return samples
+
+
+def selected_samples(wildcards=None):
+    """Forces the checkpoint to run first, then lists the selected runs."""
+    return list(read_selected(checkpoints.select_no_genbank.get().output.no_genbank))
+
+
+def sample_field(sample, field):
+    # Only called for stage-2 jobs, i.e. after the checkpoint has finished.
+    return read_selected(NO_GENBANK_TSV).get(sample, {}).get(field, "")
+
+
+def stage2_targets(wildcards):
+    samples = selected_samples()
+    if not samples:
+        print(f"[{RUN}] No SRA runs to process (none in the date window, or all already have a "
+              "GenBank record) -- nothing to assemble or annotate. See selection/ for the details.",
+              file=sys.stderr)
+        return []
+    return [METADATA_XLSX, f"{META_DIR}/.uploaded"] + expand(
+        [SAMPLE_DIR + "/summary_report.md", SAMPLE_DIR + "/.summary_uploaded"], sample=samples)
+
+
+rule all:
+    input:
+        NO_GENBANK_TSV,
+        WITH_GENBANK_TSV,
+        f"{SEL_DIR}/.published",
+        stage2_targets,
+
+
+# ---------------------------------------------------------------------------
+# 1. SRA selection
+# ---------------------------------------------------------------------------
+
+rule fetch_sra_runinfo:
+    output:
+        f"{SEL_DIR}/01_sra_runinfo.tsv",
+    params:
+        bioprojects=" ".join(BIOPROJECTS),
+        shown=", ".join(BIOPROJECTS) + (f" (+ {BIOPROJECT_FILE})" if BIOPROJECT_FILE else ""),
+        extra=" ".join(FETCH_EXTRA),
+        cache=f"{OUT_DIR}/ncbi_cache",
+        mindate=MINDATE,  # params, so a changed window refreshes this step
+        maxdate=MAXDATE,
+    log:
+        f"{LOG_DIR}/fetch_sra_runinfo.log",
+    shell:
+        """
+        python3 {SCRIPTS}/fetch_sra_runs_by_bioproject.py \
+            --bioprojects {params.bioprojects} --email {EMAIL} \
+            --output {output} --format tsv --cache-dir {params.cache} \
+            {params.extra} &> {log}
+        # A completely empty file means none of the BioProjects returned any SRA run
+        # (a header-only file just means none fell inside the date window: not an error).
+        if [ ! -s {output} ]; then
+            echo "ERROR: No SRA runs found for any of these BioProjects: {params.shown}. See {log}." | tee -a {log} >&2
+            exit 1
+        fi
+        """
+
+
+rule biosample_to_genbank:
+    input:
+        f"{SEL_DIR}/01_sra_runinfo.tsv",
+    output:
+        f"{SEL_DIR}/02_genbank_by_biosample.tsv",
+    params:
+        api_key=f"--api_key {API_KEY}" if API_KEY else "",
+    log:
+        f"{LOG_DIR}/biosample_to_genbank.log",
+    shell:
+        # Exits non-zero (and writes nothing) if a BioSample lookup keeps failing, so a
+        # failed lookup is never mistaken for "no GenBank record".
+        "python3 {SCRIPTS}/biosample_to_genbank.py --input_csv {input} --column BioSample "
+        "--email {EMAIL} {params.api_key} --out {output} --format tsv &> {log}"
+
+
+rule join_by_biosample:
+    input:
+        sra=f"{SEL_DIR}/01_sra_runinfo.tsv",
+        genbank=f"{SEL_DIR}/02_genbank_by_biosample.tsv",
+    output:
+        f"{SEL_DIR}/03_joined.tsv",
+    log:
+        f"{LOG_DIR}/join_by_biosample.log",
+    shell:
+        "python3 {SCRIPTS}/join_tables_by_biosample.py --sra-table {input.sra} "
+        "--genbank-table {input.genbank} --out {output} --format tsv &> {log}"
+
+
+checkpoint select_no_genbank:
+    input:
+        f"{SEL_DIR}/03_joined.tsv",
+    output:
+        no_genbank=NO_GENBANK_TSV,
+        with_genbank=WITH_GENBANK_TSV,
+    log:
+        f"{LOG_DIR}/select_no_genbank.log",
+    shell:
+        "python3 {SCRIPTS}/select_no_genbank.py --joined-table {input} "
+        "--output-no-genbank {output.no_genbank} --output-with-genbank {output.with_genbank} &> {log}"
+
+
+rule bvbrc_check_login:
+    output:
+        touch(LOGIN_OK),
+    log:
+        f"{LOG_DIR}/bvbrc_login.log",
+    shell:
+        """
+        p3-whoami > {log} 2>&1
+        STATUS=$?
+        if [ "$STATUS" -ne 0 ] || grep -qi "logged out" {log}; then
+            echo "ERROR: not logged in to BV-BRC. Run 'p3-login <username>' first." >&2
+            cat {log} >&2
+            exit 1
+        fi
+        """
+
+
+rule publish_selection:
+    # The selection tables go to {workspace_base}/{run_name}/selection/ on BV-BRC, so the
+    # workspace keeps a record of which runs went in and which were excluded, and why.
+    input:
+        login=LOGIN_OK,
+        joined=f"{SEL_DIR}/03_joined.tsv",
+        no_genbank=NO_GENBANK_TSV,
+        with_genbank=WITH_GENBANK_TSV,
+    output:
+        touch(f"{SEL_DIR}/.published"),
+    params:
+        ws_dir=f"{WS_RUN}/selection",
+    log:
+        f"{LOG_DIR}/publish_selection.log",
+    shell:
+        """
+        p3-mkdir "{WS_BASE}" >> {log} 2>&1 || true
+        p3-mkdir "{WS_RUN}" >> {log} 2>&1 || true
+        p3-mkdir "{params.ws_dir}" >> {log} 2>&1 || true
+        p3-cp -f {input.joined} "ws:{params.ws_dir}/all_sra_with_genbank_status.tsv" >> {log} 2>&1
+        p3-cp -f {input.no_genbank} "ws:{params.ws_dir}/no_genbank_samples.tsv" >> {log} 2>&1
+        p3-cp -f {input.with_genbank} "ws:{params.ws_dir}/with_genbank_samples.tsv" >> {log} 2>&1
+        echo "Copied the selection tables to ws:{params.ws_dir}" >> {log}
+        """
+
+
+# ---------------------------------------------------------------------------
+# 2. NCBI metadata for the selected runs (whole run_name at once)
+# ---------------------------------------------------------------------------
+
+rule fetch_metadata:
+    input:
+        NO_GENBANK_TSV,
+    output:
+        ids=f"{META_DIR}/sra_ids.txt",
+        xlsx=f"{META_DIR}/ncbi_metadata.xlsx",
+    params:
+        edirect=f"--edirect {EDIRECT}" if EDIRECT else "",
+    log:
+        f"{LOG_DIR}/fetch_metadata.log",
+    shell:
+        """
+        mkdir -p {META_DIR}
+        # the Run column of the selection table, SRA run accessions only
+        awk -F'\\t' 'NR==1 {{for (i = 1; i <= NF; i++) if ($i == "Run") c = i; next}}
+                     c && $c ~ /^[SED]RR[0-9]+$/ {{print $c}}' {input} > {output.ids}
+        {EDIRECT_ENV}python3 {SCRIPTS}/extract_sra_metadata.py {output.ids} {output.xlsx} \
+            {params.edirect} --allow-empty --location country --subtype-suffix &> {log}
+        """
+
+
+# ---------------------------------------------------------------------------
+# 3. BV-BRC IRMA assembly + subtype
+# ---------------------------------------------------------------------------
+
+rule bvbrc_submit_assembly:
+    input:
+        login=LOGIN_OK,
+    output:
+        jobid=SAMPLE_DIR + "/assembly/job_id.txt",
+        flag=touch(SAMPLE_DIR + "/assembly/.complete"),
+    params:
+        ws_path=lambda wc: f"{WS_RUN}/{wc.sample}",
+        local_dir=lambda wc: f"{OUT_DIR}/samples/{wc.sample}/assembly",
+    log:
+        SAMPLE_LOG + "/bvbrc_submit_assembly.log",
+    shell:
+        """
+        mkdir -p {params.local_dir}
+        # p3-submit-viral-assembly does not create its workspace folder itself
+        p3-mkdir "{WS_BASE}" >> {log} 2>&1 || true
+        p3-mkdir "{WS_RUN}" >> {log} 2>&1 || true
+        p3-mkdir "{params.ws_path}" >> {log} 2>&1 || true
+
+        # If the BV-BRC job fails or times out, record FAILED (plus the job id, if one
+        # was issued) instead of stopping: the run then flows through as "assembly
+        # job failed", and the metadata table still gets built and uploaded.
+        # To retry it later: rerun the same command with --forcerun <this job_id.txt>
+        # (the end-of-run report prints the exact flag).
+        if ! bash {SCRIPTS}/bvbrc_submit_and_wait.sh \
+            "{output.jobid}" "{POLL}" "{TIMEOUT}" "{log}" \
+            p3-submit-viral-assembly \
+                --srr-id "{wildcards.sample}" \
+                --strategy "{STRATEGY}" \
+                "{params.ws_path}" assembly; then
+            JOB_ID="$(cat "{output.jobid}" 2>/dev/null || true)"
+            echo "FAILED${{JOB_ID:+ $JOB_ID}}" > "{output.jobid}"
+            echo "WARNING: BV-BRC assembly for {wildcards.sample} failed or timed out" \
+                 "(job: ${{JOB_ID:-not submitted}}); recorded as FAILED. See {log}." | tee -a {log} >&2
+        fi
+        """
+
+
+rule bvbrc_fetch_assembly:
+    input:
+        flag=SAMPLE_DIR + "/assembly/.complete",
+        jobid=SAMPLE_DIR + "/assembly/job_id.txt",
+    output:
+        local_copy(directory(SAMPLE_DIR + "/assembly/bvbrc_output")),
+    params:
+        ws_path=lambda wc: f"{WS_RUN}/{wc.sample}/.assembly",
+    log:
+        SAMPLE_LOG + "/bvbrc_fetch_assembly.log",
+    shell:
+        """
+        mkdir -p {output}
+        if grep -q "^FAILED" "{input.jobid}"; then
+            echo "Assembly job failed for {wildcards.sample}; nothing to fetch." > {log}
+            exit 0
+        fi
+        p3-cp -r "ws:{params.ws_path}/" {output} &> {log}
+        # Drop the raw reads BV-BRC downloaded from SRA (100s of MB, already in SRA).
+        # p3-cp nests them inside the fetched .assembly/ folder, so search one level down too.
+        find {output} -maxdepth 2 -type f -name "{wildcards.sample}_*.fastq" -delete
+        find {output} -maxdepth 2 -type d -name "{wildcards.sample}" -prune -exec rm -rf {{}} +
+        """
+
+
+rule pick_contigs:
+    input:
+        SAMPLE_DIR + "/assembly/bvbrc_output",
+    output:
+        local_copy(SAMPLE_DIR + "/assembly/contigs.fasta"),
+    log:
+        SAMPLE_LOG + "/pick_contigs.log",
+    shell:
+        "python3 {SCRIPTS}/pick_contigs.py {input} {output} &> {log}"
+
+
+rule assembly_subtype:
+    input:
+        assembly_dir=SAMPLE_DIR + "/assembly/bvbrc_output",
+        contigs=SAMPLE_DIR + "/assembly/contigs.fasta",
+        jobid=SAMPLE_DIR + "/assembly/job_id.txt",
+    output:
+        SAMPLE_DIR + "/assembly/assembly_subtype.tsv",
+    log:
+        SAMPLE_LOG + "/assembly_subtype.log",
+    shell:
+        "python3 {SCRIPTS}/assembly_subtype.py --sample {wildcards.sample} "
+        "--assembly-dir {input.assembly_dir} --contigs {input.contigs} "
+        "--assembly-jobid {input.jobid} --output {output} &> {log}"
+
+
+# ---------------------------------------------------------------------------
+# 4. Final metadata table
+# ---------------------------------------------------------------------------
+
+rule finalize_metadata:
+    input:
+        metadata=f"{META_DIR}/ncbi_metadata.xlsx",
+        assembly=lambda wc: expand(SAMPLE_DIR + "/assembly/assembly_subtype.tsv",
+                                   sample=selected_samples()),
+    output:
+        xlsx=METADATA_XLSX,
+        tsv=METADATA_TSV,
+    params:
+        samples=lambda wc: " ".join(selected_samples()),
+    log:
+        f"{LOG_DIR}/finalize_metadata.log",
+    shell:
+        "python3 {SCRIPTS}/finalize_metadata.py --metadata {input.metadata} "
+        "--assembly {input.assembly} --samples {params.samples} "
+        "--output {output.xlsx} --output-tsv {output.tsv} &> {log}"
+
+
+rule upload_metadata:
+    # The TSV must upload; the .xlsx is best-effort (BV-BRC may not accept the type).
+    input:
+        login=LOGIN_OK,
+        xlsx=METADATA_XLSX,
+        tsv=METADATA_TSV,
+    output:
+        touch(f"{META_DIR}/.uploaded"),
+    params:
+        ws_dir=f"{WS_RUN}/metadata",
+    log:
+        f"{LOG_DIR}/upload_metadata.log",
+    shell:
+        """
+        p3-mkdir "{WS_BASE}" >> {log} 2>&1 || true
+        p3-mkdir "{WS_RUN}" >> {log} 2>&1 || true
+        p3-mkdir "{params.ws_dir}" >> {log} 2>&1 || true
+        p3-cp -f {input.tsv} "ws:{params.ws_dir}/{RUN}_metadata.tsv" >> {log} 2>&1
+        p3-cp -f -m xlsx=xlsx {input.xlsx} "ws:{params.ws_dir}/{RUN}_metadata.xlsx" >> {log} 2>&1 \
+            || p3-cp -f {input.xlsx} "ws:{params.ws_dir}/{RUN}_metadata.xlsx" >> {log} 2>&1 \
+            || echo "WARNING: BV-BRC did not accept the .xlsx upload; the .tsv was uploaded" >> {log}
+        echo "Uploaded metadata to ws:{params.ws_dir}" >> {log}
+        """
+
+
+# ---------------------------------------------------------------------------
+# 5. BV-BRC genome annotation (VIGOR4, viral-lowvan) + summary
+# ---------------------------------------------------------------------------
+
+rule bvbrc_submit_annotation:
+    input:
+        login=LOGIN_OK,
+        contigs=SAMPLE_DIR + "/assembly/contigs.fasta",
+        subtype=SAMPLE_DIR + "/assembly/assembly_subtype.tsv",
+    output:
+        jobid=SAMPLE_DIR + "/annotation/job_id.txt",
+        flag=touch(SAMPLE_DIR + "/annotation/.complete"),
+    params:
+        ws_path=lambda wc: f"{WS_RUN}/{wc.sample}",
+        upload_path=lambda wc: f"{WS_RUN}/{wc.sample}/uploads",
+        local_dir=lambda wc: f"{OUT_DIR}/samples/{wc.sample}/annotation",
+        sci_name=lambda wc: sample_field(wc.sample, "scientific_name") or DEFAULT_SCI_NAME,
+        taxonomy_id=lambda wc: sample_field(wc.sample, "taxonomy_id"),
+    log:
+        SAMPLE_LOG + "/bvbrc_submit_annotation.log",
+    shell:
+        """
+        mkdir -p {params.local_dir}
+        if [ ! -s "{input.contigs}" ]; then
+            echo "No assembled contigs available for {wildcards.sample} -- skipping annotation." | tee {log} >&2
+            echo "SKIPPED" > {output.jobid}
+            exit 0
+        fi
+
+        # upload the contigs ourselves (p3-submit-genome-annotation's own upload is unreliable)
+        p3-mkdir "{WS_RUN}" >> {log} 2>&1 || true
+        p3-mkdir "{params.ws_path}" >> {log} 2>&1 || true
+        p3-mkdir "{params.upload_path}" >> {log} 2>&1 || true
+        p3-cp -f "{input.contigs}" "ws:{params.upload_path}/contigs.fasta" >> {log} 2>&1
+
+        ARGS=(--scientific-name "{params.sci_name}")
+        if [ -n "{params.taxonomy_id}" ]; then
+            ARGS+=(--taxonomy-id "{params.taxonomy_id}")
+        fi
+        bash {SCRIPTS}/bvbrc_submit_and_wait.sh \
+            "{output.jobid}" "{POLL}" "{TIMEOUT}" "{log}" \
+            p3-submit-genome-annotation \
+                --overwrite \
+                --contigs-file "ws:{params.upload_path}/contigs.fasta" \
+                --recipe "{ANNOTATION_RECIPE}" \
+                --genetic-code "{GENETIC_CODE}" \
+                --domain "{DOMAIN}" \
+                --index-nowait \
+                {PUBLIC_FLAG} \
+                "${{ARGS[@]}}" \
+                "{params.ws_path}" annotation
+        """
+
+
+rule bvbrc_fetch_annotation:
+    input:
+        flag=SAMPLE_DIR + "/annotation/.complete",
+        jobid=SAMPLE_DIR + "/annotation/job_id.txt",
+    output:
+        local_copy(directory(SAMPLE_DIR + "/annotation/bvbrc_output")),
+    params:
+        ws_path=lambda wc: f"{WS_RUN}/{wc.sample}/.annotation",
+    log:
+        SAMPLE_LOG + "/bvbrc_fetch_annotation.log",
+    shell:
+        """
+        mkdir -p {output}
+        if grep -qx "SKIPPED" "{input.jobid}"; then
+            echo "Annotation was skipped for {wildcards.sample}; nothing to fetch." > {log}
+            exit 0
+        fi
+        p3-cp -r "ws:{params.ws_path}/" {output} &> {log}
+        """
+
+
+rule make_summary:
+    input:
+        assembly_dir=SAMPLE_DIR + "/assembly/bvbrc_output",
+        contigs=SAMPLE_DIR + "/assembly/contigs.fasta",
+        annotation_dir=SAMPLE_DIR + "/annotation/bvbrc_output",
+        assembly_jobid=SAMPLE_DIR + "/assembly/job_id.txt",
+        annotation_jobid=SAMPLE_DIR + "/annotation/job_id.txt",
+    output:
+        SAMPLE_DIR + "/summary_report.md",
+    params:
+        ws_path=lambda wc: f"{WS_RUN}/{wc.sample}",
+    log:
+        SAMPLE_LOG + "/make_summary.log",
+    shell:
+        "python3 {SCRIPTS}/make_summary.py --sample {wildcards.sample} "
+        "--workspace-path \"{params.ws_path}\" "
+        "--assembly-dir {input.assembly_dir} --contigs {input.contigs} "
+        "--annotation-dir {input.annotation_dir} "
+        "--assembly-jobid {input.assembly_jobid} --annotation-jobid {input.annotation_jobid} "
+        "--output {output} &> {log}"
+
+
+rule upload_summary:
+    input:
+        login=LOGIN_OK,
+        summary=SAMPLE_DIR + "/summary_report.md",
+    output:
+        touch(SAMPLE_DIR + "/.summary_uploaded"),
+    params:
+        ws_path=lambda wc: f"{WS_RUN}/{wc.sample}",
+    log:
+        SAMPLE_LOG + "/upload_summary.log",
+    shell:
+        """
+        p3-cp -f {input.summary} "ws:{params.ws_path}/summary_report.md" > {log} 2>&1
+        """
+
+
+# ---------------------------------------------------------------------------
+# End-of-run report: assembly jobs recorded as FAILED don't stop the run (see
+# bvbrc_submit_assembly), so list them here where they can't be missed.
+# ---------------------------------------------------------------------------
+
+def report_failed_assemblies():
+    failed = []
+    for s in read_selected(NO_GENBANK_TSV):
+        path = f"{OUT_DIR}/samples/{s}/assembly/job_id.txt"
+        try:
+            with open(path) as fh:
+                if fh.read().startswith("FAILED"):
+                    failed.append(path)
+        except OSError:
+            pass
+    if failed:
+        print(f"\nWARNING: {len(failed)} BV-BRC assembly job(s) failed or timed out "
+              "(marked in the metadata table's subtype_note as 'assembly job failed'):",
+              file=sys.stderr)
+        for path in failed:
+            print(f"  {path}", file=sys.stderr)
+        # Deleting job_id.txt is not enough: Snakemake does not rebuild a missing
+        # intermediate file when the sample's final outputs already exist.
+        print("To retry only these runs, rerun the same snakemake command with:\n"
+              f"  --forcerun {' '.join(failed)}", file=sys.stderr)
+
+
+onsuccess:
+    report_failed_assemblies()
+
+
+onerror:
+    report_failed_assemblies()
