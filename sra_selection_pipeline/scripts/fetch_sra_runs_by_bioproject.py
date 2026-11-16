@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import io
 import json
 import os
@@ -57,7 +58,9 @@ class DiskCache:
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     def _path(self, namespace: str, key: str, suffix: str = ".json") -> Path:
-        safe_key = str(abs(hash(key)))
+        # sha256, not hash(): Python's hash() of a string changes every run, so the
+        # cache file names never matched on the next run and the cache was never reused.
+        safe_key = hashlib.sha256(key.encode("utf-8")).hexdigest()
         p = self.base_dir / namespace
         p.mkdir(parents=True, exist_ok=True)
         return p / f"{safe_key}{suffix}"
@@ -99,16 +102,11 @@ class NCBIClient:
                 print(f"[WARN]   NCBI {key}: {msg}")
 
     def esearch_ids(self, db: str, term: str, retmax: int = 100000) -> List[str]:
+        # Deliberately NOT read from the cache: a BioProject keeps gaining new SRA
+        # runs, and a cached search would hide them forever. The response is still
+        # saved (under esearch/) for reference. Only the per-batch RunInfo fetches,
+        # keyed by the exact run ids, are reused from the cache.
         cache_key = f"esearch|db={db}|term={term}|retmax={retmax}"
-        cached = self.cache.get_text("esearch", cache_key, ".json")
-        if cached:
-            try:
-                result = json.loads(cached)
-                self._log_search(result)
-                return result.get("IdList", [])
-            except Exception:
-                pass
-
         last_err = None
         for attempt in range(5):
             try:

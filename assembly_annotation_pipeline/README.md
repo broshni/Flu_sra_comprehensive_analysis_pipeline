@@ -30,7 +30,7 @@ assembling, see the sibling `sra_selection_pipeline/` in this repo.
 
 ## Requirements
 
-- Snakemake (`pip install snakemake` or `conda install -c bioconda snakemake`)
+- Snakemake 8 or newer (`pip install snakemake` or `conda install -c bioconda snakemake`)
 - **The BV-BRC command line interface (`p3-tools`)**, installed separately --
   it is not a Python/conda package. Download an installer for your OS from
   https://github.com/BV-BRC/BV-BRC-CLI/releases and follow BV-BRC's install
@@ -188,12 +188,10 @@ results/<sample>/
   (falling back to concatenating the per-segment files itself if not). Check
   `results/<sample>/assembly/bvbrc_output/` if this picks the wrong thing for
   an unusual output layout.
-- After fetching, the `bvbrc_fetch_assembly` rule tries to delete the local
-  copies of the raw `<SRR>_*.fastq` files and `<SRR>/` folder (100s of MB,
-  already in SRA), but it only looks at the top of `bvbrc_output/`. `p3-cp`
-  puts them one level down, in `bvbrc_output/.assembly/`, so they are usually
-  left in place -- use `cleanup_local=true` or delete them by hand if disk
-  space matters.
+- After fetching, the `bvbrc_fetch_assembly` rule deletes the local copies
+  of the raw `<SRR>_*.fastq` files and `<SRR>/` folder (100s of MB, already in
+  SRA). `p3-cp` nests them under `bvbrc_output/.assembly/`, and the rule looks
+  there too.
 - `p3-submit-viral-assembly` was provided directly rather than pulled from
   BV-BRC's public docs (which only describe the underlying IRMA service
   through its web form, currently marked Beta). If your installed CLI
@@ -211,11 +209,10 @@ results/<sample>/
 - A BV-BRC job that fails or times out stops that sample (with
   `--keep-going`, the other samples carry on). Rerunning the same command
   resubmits only the samples that didn't finish.
-- Editing the `Snakefile` can make Snakemake rerun -- and so resubmit to
-  BV-BRC -- jobs for samples that already finished (Snakemake reruns jobs
-  whose rule code changed). Do a dry run (`-n`) after any edit; if it lists
-  jobs for finished samples with "Code has changed since last execution",
-  add `--rerun-triggers mtime` to the command.
+- `profiles/default/config.yaml` (loaded automatically by Snakemake 8+) sets
+  `rerun-triggers: [mtime, params]`, so editing the `Snakefile` or scripts
+  never makes Snakemake resubmit BV-BRC jobs for samples that already
+  finished. Use `--forcerun <file or rule>` when you do want something redone.
 - BV-BRC also has other virus-specific services worth knowing about if they
   fit your sample better: `p3-submit-sars2-assembly` /
   `p3-submit-sars2-analysis` for SARS-CoV-2 specifically.

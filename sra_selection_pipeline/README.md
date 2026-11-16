@@ -26,7 +26,7 @@ Before cloning, you'll need:
   passes it.
 - Log in once per machine: `p3-login <your-username>` (the pipeline checks
   this and fails fast with a clear message if you're not logged in).
-- **Python 3.8+** with **Snakemake** (`pip install snakemake`) and
+- **Python 3.8+** with **Snakemake 8 or newer** (`pip install snakemake`) and
   **biopython** + **pandas** (see Requirements below).
 - **An NCBI Entrez contact email.** NCBI requires this for any automated
   querying (this is what SRA/GenBank lookups use); it doesn't need to be
@@ -178,7 +178,7 @@ results/<run_name>/
 ├── 03_joined.tsv                    # 01 + 02 joined on BioSample
 ├── no_genbank_samples.tsv           # runs with NO GenBank accession -- what step 2 processes
 ├── with_genbank_samples.tsv         # runs excluded because one already exists
-├── ncbi_cache/                      # raw NCBI responses written by step 1
+├── ncbi_cache/                      # NCBI responses; RunInfo fetches are reused on reruns
 └── samples/
     └── <SRR...>/
         ├── assembly/{job_id.txt, contigs.fasta, bvbrc_output/}
@@ -210,12 +210,13 @@ went in and which were excluded, and why.
   (search, link, summary), so a BioProject with hundreds of samples will take
   a while and is worth an `api_key` (NCBI's rate limit is much lower without
   one).
-- **A failed GenBank lookup counts as "no GenBank record".** If NCBI errors
-  for a BioSample (rate limit, timeout), `biosample_to_genbank.py` logs
-  `Error processing <BioSample>` and moves on without retrying, so that
-  sample's runs land in `no_genbank_samples.tsv` and get assembled. Check
-  `logs/<run_name>/biosample_to_genbank.log` for those lines before trusting
-  step 2's sample list on a large pull.
+- **Failed GenBank lookups stop the run instead of being guessed.** Each
+  BioSample lookup is retried up to 4 times with backoff (rate limits,
+  timeouts). If any still fails, `biosample_to_genbank` stops with a list of
+  those BioSamples in `logs/<run_name>/biosample_to_genbank.log` and writes no
+  table, so nothing reaches assembly on a half-finished lookup; rerun the same
+  command to retry. A BioSample that NCBI says doesn't exist is a real answer
+  and counts as "no GenBank record".
 - **Each `run_name` is independent.** A run that still has no GenBank record
   is assembled (and, with `public: true`, published) again by every new
   `run_name` whose BioProjects/date window include it -- BV-BRC assemblies
@@ -224,14 +225,18 @@ went in and which were excluded, and why.
 - Re-running an existing `run_name` with the same settings does not re-query
   NCBI (step 1's outputs already exist); change the settings or use a new
   `run_name` for a fresh pull.
-- The `ncbi_cache/` folder does not currently get reused between runs (its
-  file names are not stable from one Python process to the next), so it only
-  grows; it is safe to delete.
-- After fetching the assembly, the pipeline tries to delete the raw reads
-  BV-BRC downloaded from SRA (`<SRR>_1.fastq`, `<SRR>_2.fastq`, `<SRR>/`), but
-  it only looks at the top of `bvbrc_output/`. `p3-cp` puts them one level
-  down, in `bvbrc_output/.assembly/`, so they are usually left in place -- use
-  `cleanup_local=true` or delete them by hand if disk space matters.
+- `ncbi_cache/` (per `run_name`) keeps every NCBI response. The RunInfo
+  fetches, keyed by the exact run ids, are reused when the same `run_name` is
+  rerun; the BioProject searches are always re-run, so newly added SRA runs
+  are never hidden by the cache. Safe to delete.
+- After fetching the assembly, the pipeline deletes the local copies of the
+  raw reads BV-BRC downloaded from SRA (`<SRR>_1.fastq`, `<SRR>_2.fastq`,
+  `<SRR>/`, inside `bvbrc_output/.assembly/`); they are 100s of MB and still
+  in SRA.
+- `profiles/default/config.yaml` (loaded automatically by Snakemake 8+) sets
+  `rerun-triggers: [mtime, params]`, so editing the `Snakefile` or scripts
+  never makes Snakemake resubmit BV-BRC jobs for samples that already
+  finished. Use `--forcerun <file or rule>` when you do want something redone.
 - `select_no_genbank.py` treats a run as "no GenBank accession" if the
   joined table's `genbank_accessions` field is empty or missing --
   double-check `03_joined.tsv` by eye the first time you run a new

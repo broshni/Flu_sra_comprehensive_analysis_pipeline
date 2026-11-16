@@ -360,8 +360,10 @@ rule bvbrc_fetch_assembly:
         """
         mkdir -p {output}
         p3-cp -r "ws:{params.ws_path}/" {output} &> {log}
-        rm -f {output}/{params.srr}_1.fastq {output}/{params.srr}_2.fastq
-        rm -rf {output}/{params.srr}
+        # Drop the raw reads BV-BRC downloaded from SRA (100s of MB, already in SRA).
+        # p3-cp nests them inside the fetched .assembly/ folder, so search one level down too.
+        find {output} -maxdepth 2 -type f -name "{params.srr}_*.fastq" -delete
+        find {output} -maxdepth 2 -type d -name "{params.srr}" -prune -exec rm -rf {{}} +
         """
 
 

@@ -241,12 +241,10 @@ rule bvbrc_fetch_assembly:
         """
         mkdir -p {output}
         p3-cp -r "ws:{params.ws_path}/" {output} &> {log}
-        # BV-BRC's IRMA job dir includes the raw reads it downloaded from SRA
-        # (e.g. {params.srr}_1.fastq, {params.srr}_2.fastq, and a {params.srr}/
-        # staging folder) -- these are large (100s of MB) and redundant since
-        # they're already in SRA, so drop the local copies once fetched.
-        rm -f {output}/{params.srr}_1.fastq {output}/{params.srr}_2.fastq
-        rm -rf {output}/{params.srr}
+        # Drop the raw reads BV-BRC downloaded from SRA (100s of MB, already in SRA).
+        # p3-cp nests them inside the fetched .assembly/ folder, so search one level down too.
+        find {output} -maxdepth 2 -type f -name "{params.srr}_*.fastq" -delete
+        find {output} -maxdepth 2 -type d -name "{params.srr}" -prune -exec rm -rf {{}} +
         """
 
 

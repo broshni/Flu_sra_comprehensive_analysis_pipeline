@@ -27,7 +27,9 @@ All three need:
 - A [BV-BRC](https://www.bv-brc.org/) account (free) and the BV-BRC CLI
   (`p3-tools`) installed and logged in (`p3-login <username>`) -- see each
   pipeline's own README for install links.
-- Snakemake (`pip install snakemake`).
+- Snakemake 8 or newer (`pip install snakemake`). Each pipeline has a
+  `profiles/default/config.yaml` that Snakemake picks up automatically, so
+  editing a `Snakefile` never resubmits BV-BRC jobs for finished samples.
 - A `config.yaml` you create from that pipeline's `config.yaml.example`.
   Each pipeline's real `config.yaml` (and `samples.tsv`) is gitignored, as are
   `results/`, `logs/` and `.snakemake/`, so cloning or pushing this repo never

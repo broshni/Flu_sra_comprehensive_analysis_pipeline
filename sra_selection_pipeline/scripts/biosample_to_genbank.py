@@ -20,11 +20,36 @@ Note:
 
 """
 
+import sys
 import time
 import argparse
 from typing import Optional
 from Bio import Entrez
 import pandas as pd
+
+
+class BioSampleNotFound(ValueError):
+    """NCBI answered, and has no BioSample with this accession (not a lookup failure)."""
+
+
+RETRIES = 4  # attempts per BioSample before it counts as a failed lookup
+
+
+def lookup_with_retries(biosample_acc, email, api_key=None, use_efetch_date=False):
+    """biosample_to_nucleotide with retries and backoff for transient NCBI errors
+    (rate limits, timeouts). BioSampleNotFound is a real answer and is not retried."""
+    for attempt in range(1, RETRIES + 1):
+        try:
+            return biosample_to_nucleotide(biosample_acc, email, api_key=api_key,
+                                           use_efetch_date=use_efetch_date)
+        except BioSampleNotFound:
+            raise
+        except Exception as e:
+            if attempt == RETRIES:
+                raise
+            wait = 2 ** attempt
+            print(f"  retry {attempt}/{RETRIES - 1} for {biosample_acc} in {wait}s after error: {e}")
+            time.sleep(wait)
 
 
 def biosample_to_nucleotide(
@@ -49,7 +74,7 @@ def biosample_to_nucleotide(
         search = Entrez.read(h)
     idlist = search.get("IdList", [])
     if not idlist:
-        raise ValueError(f"No BioSample found for accession '{biosample_acc}'")
+        raise BioSampleNotFound(f"No BioSample found for accession '{biosample_acc}'")
 
     biosample_uid = idlist[0]
 
@@ -182,7 +207,7 @@ def main():
             df_input = pd.read_csv(args.input_csv, **read_kwargs)
         except Exception as e:
             print(f"Failed to read input CSV '{args.input_csv}': {e}")
-            return
+            sys.exit(1)
 
         # try to find the requested column, case-insensitive fallback
         col = args.column
@@ -199,16 +224,32 @@ def main():
         print(f"Found {len(biosamples)} unique biosample accessions in '{args.input_csv}' (column '{col}')")
 
         all_rows = []
+        failed = []  # (biosample, error) -- lookups that still failed after retries
         for idx, bs in enumerate(biosamples, 1):
             print(f"[{idx}/{len(biosamples)}] Processing BioSample {bs}...")
             try:
-                df_bs = biosample_to_nucleotide(bs, args.email, api_key=args.api_key, use_efetch_date=args.efetch_date)
+                df_bs = lookup_with_retries(bs, args.email, api_key=args.api_key, use_efetch_date=args.efetch_date)
                 if not df_bs.empty:
                     all_rows.append(df_bs)
+            except BioSampleNotFound as e:
+                # NCBI has no such BioSample, so it has no GenBank records either
+                print(f"  {e} -- treating as no GenBank record")
             except Exception as e:
                 print(f"  Error processing {bs}: {e}")
+                failed.append((bs, str(e)))
             # small delay to be gentle to NCBI
             time.sleep(0.34)
+
+        if failed:
+            # A failed lookup is not a "no GenBank record" answer. Writing the table
+            # anyway would send these BioSamples' runs on to assembly, so stop instead
+            # and write no output; rerunning retries the whole lookup.
+            print(f"ERROR: GenBank lookup failed for {len(failed)} of {len(biosamples)} "
+                  f"BioSample(s) after {RETRIES} attempts each; no output written:")
+            for bs, err in failed:
+                print(f"  {bs}: {err}")
+            print("Rerun to retry (an NCBI API key makes rate-limit errors much less likely).")
+            sys.exit(1)
 
         if all_rows:
             combined = pd.concat(all_rows, ignore_index=True)
@@ -222,6 +263,7 @@ def main():
                 print(f"Wrote combined results for {len(biosamples)} biosamples to {args.out}")
             except Exception as e:
                 print(f"Failed to write output file '{args.out}': {e}")
+                sys.exit(1)
         else:
             # print to stdout using chosen separator
             if combined.empty:
