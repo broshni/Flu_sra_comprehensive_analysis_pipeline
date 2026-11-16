@@ -108,7 +108,7 @@ STRATEGY = BVBRC.get("viral_assembly_strategy", "IRMA")
 ANNOTATION_RECIPE = BVBRC.get("annotation_recipe", "viral-lowvan")
 GENETIC_CODE = BVBRC.get("genetic_code", 11)
 DOMAIN = BVBRC.get("domain", "Bacteria")
-ANNOTATION_PUBLIC = BVBRC.get("public", True)
+ANNOTATION_PUBLIC = BVBRC.get("public", False)  # private unless public: true
 PUBLIC_FLAG = "--public" if ANNOTATION_PUBLIC else ""
 
 # Per-sample local/remote paths for stage 2, all namespaced under this run's
@@ -396,7 +396,6 @@ rule bvbrc_submit_annotation:
         recipe=ANNOTATION_RECIPE,
         genetic_code=GENETIC_CODE,
         domain=DOMAIN,
-        public_flag=PUBLIC_FLAG,
         poll=POLL,
         timeout=TIMEOUT,
     log:
@@ -435,7 +434,7 @@ rule bvbrc_submit_annotation:
                 --genetic-code "{params.genetic_code}" \
                 --domain "{params.domain}" \
                 --index-nowait \
-                {params.public_flag} \
+                {PUBLIC_FLAG} \
                 $EXTRA_ARGS \
                 "{params.ws_path}" annotation
         """

@@ -17,8 +17,9 @@ needs. Pick whichever fits what you're starting from.
 
 All four submit to BV-BRC's IRMA-based Viral Assembly service and its
 Genome Annotation service (VIGOR4, recipe `viral-lowvan`) the same way, and
-write a `summary_report.md` per sample. Annotated genomes are submitted with
-`--public` by default (`bvbrc.public` in each `config.yaml`).
+write a `summary_report.md` per sample. Annotated genomes are private by default;
+set `bvbrc.public: true` in a pipeline's `config.yaml` to submit them with
+`--public` (visible to all BV-BRC users).
 
 ## Setup
 

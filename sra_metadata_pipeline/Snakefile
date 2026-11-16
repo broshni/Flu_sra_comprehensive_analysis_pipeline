@@ -110,7 +110,7 @@ STRATEGY = BVBRC.get("viral_assembly_strategy", "IRMA")
 ANNOTATION_RECIPE = BVBRC.get("annotation_recipe", "viral-lowvan")
 GENETIC_CODE = BVBRC.get("genetic_code", 11)
 DOMAIN = BVBRC.get("domain", "Bacteria")
-PUBLIC_FLAG = "--public" if BVBRC.get("public", True) else ""
+PUBLIC_FLAG = "--public" if BVBRC.get("public", False) else ""  # private unless public: true
 
 # Local storage: by default the downloaded BV-BRC outputs (assembly/annotation folders,
 # contigs.fasta) are temporary -- Snakemake deletes them as soon as the last step that

@@ -135,9 +135,8 @@ N are known. Filter on `subtype_note` to find the records that need a look.
   Only those samples are resubmitted, and the batch metadata table is rebuilt.
   (Just deleting job_id.txt does not work: Snakemake won't rebuild it while the
   sample's later outputs exist.)
-- Annotated genomes are submitted with `--public` (visible to all BV-BRC
-  users) because `bvbrc.public` is `true` in `config.yaml.example`; set it to
-  `false` to keep them private.
+- Annotated genomes are private by default (`bvbrc.public: false`); set it to
+  `true` to submit them with `--public` (visible to all BV-BRC users).
 - The annotation job is labelled with `scientific_name` from `samples.tsv`,
   falling back to `default_scientific_name` ("Influenza A virus"). It is not
   labelled with the metadata `genome_name`.

@@ -68,8 +68,8 @@ bvbrc:
   domain: "Bacteria"
 
   # Whether annotated genomes are submitted with --public (visible to other
-  # BV-BRC users). Set to false to keep them private.
-  public: true
+  # BV-BRC users). false (default) keeps them private.
+  public: false
 
   # How often (seconds) to poll p3-job-status while waiting for a job.
   poll_interval_sec: 30

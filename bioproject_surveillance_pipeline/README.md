@@ -184,11 +184,11 @@ H and N are known. Filter on `subtype_note` to find the records that need a look
 ## Notes
 
 - **Use non-overlapping date windows for recurring pulls.** Each `run_name` is
-  independent: a run that still has no GenBank record is assembled -- and,
-  with `public: true`, published -- again by every new `run_name` whose
-  window includes it, because BV-BRC assemblies don't create GenBank records.
-- **Annotated genomes are public by default** (`bvbrc.public: true`). Set it
-  to `false` to keep them private.
+  independent: a run that still has no GenBank record is assembled and
+  annotated again by every new `run_name` whose window includes it, because
+  BV-BRC assemblies don't create GenBank records.
+- **Annotated genomes are private by default** (`bvbrc.public: false`). Set it
+  to `true` to submit them with `--public` (visible to all BV-BRC users).
 - The annotation job is labelled with the run's SRA `ScientificName` and
   `TaxID` (falling back to `default_scientific_name`), not with the metadata
   `genome_name`.

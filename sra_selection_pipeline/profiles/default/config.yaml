@@ -2,7 +2,7 @@
 #
 # Only rerun a job when its input files are newer or its params changed -- NOT
 # when the rule's code or input list was edited. Every assembly/annotation job
-# here is a remote BV-BRC submission (and a public genome), so editing the
+# here is a remote BV-BRC submission (and a genome in your workspace), so editing the
 # Snakefile must never resubmit samples of a batch that already finished.
 # To redo something on purpose, use --forcerun <file or rule>.
 rerun-triggers: [mtime, params]

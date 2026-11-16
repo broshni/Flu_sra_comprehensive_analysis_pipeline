@@ -49,6 +49,6 @@ bvbrc:
   annotation_recipe: "viral-lowvan"
   genetic_code: 11
   domain: "Bacteria"        # BV-BRC requires Bacteria/Archaea even for viruses
-  public: true              # annotated genomes are visible to all BV-BRC users
+  public: false             # true = annotated genomes visible to all BV-BRC users
   poll_interval_sec: 30
   timeout_sec: 21600        # 6 hours

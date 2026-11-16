@@ -133,7 +133,10 @@ Other `config.yaml` fields:
   Bacteria` is correct even for a virus; BV-BRC's schema has no "Virus"
   option and requires this field.
 - `bvbrc.public`: whether annotated genomes are submitted with `--public`
-  (visible to other BV-BRC users). Set to `false` to keep them private.
+  (visible to other BV-BRC users). `false` (the default) keeps them private.
+  Note: batches that already finished were annotated with `--public`, and Snakemake
+  remembers that. Rerunning one of those batches now would resubmit its annotation
+  jobs as private copies; add `--rerun-triggers mtime` if you rerun an old batch.
 - `bvbrc.poll_interval_sec` / `bvbrc.timeout_sec`: how often to check job
   status and how long to wait before giving up.
 

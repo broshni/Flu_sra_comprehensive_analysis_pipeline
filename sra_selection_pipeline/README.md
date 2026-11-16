@@ -155,7 +155,12 @@ snakemake --cores 4 --keep-going --config sra_bioprojects=PRJNA1122849 sra_run_n
 And `config.yaml`'s `bvbrc:` block controls step 2 -- `workspace_base`
 (where BV-BRC job output goes), `viral_assembly_strategy`,
 `annotation_recipe`, `genetic_code`, `domain`, `public`, `poll_interval_sec`,
-`timeout_sec`.
+`timeout_sec`. `public` is `false` by default, so annotated
+genomes stay private; set it to `true` to submit them with `--public`.
+
+Note: batches that already finished were annotated with `--public`, and Snakemake
+remembers that. Rerunning one of those batches now would resubmit its annotation
+jobs as private copies; add `--rerun-triggers mtime` if you rerun an old batch.
 
 **Local disk cleanup for big BioProject pulls.** Pass
 `--config cleanup_local=true` to delete each sample's local `bvbrc_output/`
@@ -218,7 +223,7 @@ went in and which were excluded, and why.
   command to retry. A BioSample that NCBI says doesn't exist is a real answer
   and counts as "no GenBank record".
 - **Each `run_name` is independent.** A run that still has no GenBank record
-  is assembled (and, with `public: true`, published) again by every new
+  is assembled and annotated again by every new
   `run_name` whose BioProjects/date window include it -- BV-BRC assemblies
   don't create GenBank records. Use non-overlapping date windows for
   recurring pulls.
